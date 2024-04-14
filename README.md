@@ -13,26 +13,26 @@ This quickly hacked Python script organizes all PDFs in a given directory by par
 
 - **Python**: Ensure Python is installed on your system.
 - **Python Libraries**: Requires specific libraries which can be installed via pip:
-  \```bash
+  ```bash
   pip install PyPDF2 pdf2image pytesseract tqdm openai
-  \```
+  ```
 - **System Dependencies**:
   - **Poppler and Tesseract**: Necessary for PDF to image conversion and OCR functionality.
-    \```bash
+    ```bash
     sudo apt-get install poppler-utils tesseract-ocr tesseract-ocr-eng
-    \```
+    ```
 - **Ollama Setup**:
   - **Model Installation**: The script uses a local Ollama instance with a specific LLM model. The default is `cas/spaetzle-v58`, suitable for English and German text. Change the model as per your requirements.
-    \```bash
+    ```bash
     ollama pull cas/spaetzle-v58
-    \```
+    ```
 
 ## Usage
 
 Run the script in the directory containing the PDFs you want to sort:
 
-\```bash
+```bash
 python sort_files.py ./
-\```
+```
 
 This command sorts all PDFs in the current directory. Customize the script's model or configurations as necessary to fit your specific needs.

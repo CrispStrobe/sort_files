@@ -1,3 +1,4 @@
+
 # PDF File Sorting Script
 
 This quickly hacked Python script organizes all PDFs in a given directory by parsing their content. It moves each file into a directory named after the first author (formatted as "Lastname Surname") and renames the file in the format "year title.pdf".

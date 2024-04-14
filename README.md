@@ -32,7 +32,7 @@ This quickly hacked Python script organizes all PDFs in a given directory by par
 Run the script in the directory containing the PDFs you want to sort:
 
 ```bash
-python sort_files.py ./
+python parse_pdfs.py ./
 ```
 
 This command sorts all PDFs in the current directory. Customize the script's model or configurations as necessary to fit your specific needs.

@@ -70,6 +70,9 @@ def sort_author_names(author_names, attempt=1, verbose=False):
         api_key="ollama"
     )
 
+    if verbose:
+       print(f"Querying the server to correct author name: {author_names}.\n")
+
     prompt = (f"You will be given an author name that you must put into the format 'Lastname Surname'."
               f"So, you must first make an educated guess if the given input is already in this format. If so, return it back."
               f"If not and it is more plausibly in the format 'Surname(s) Lastname', you must reformat it."
@@ -92,47 +95,23 @@ def sort_author_names(author_names, attempt=1, verbose=False):
     name = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name)
 
     if name:
-        ordered_name = sanitize_filename(name.group(1).strip())
-        ordered_name = clean_author_name(ordered_name)
+        ordered_name = name.group(1).strip()
+        # Split to take only the first author if multiple are present
+        ordered_name = ordered_name.split(",")[0].strip()
+        if verbose:
+            print(f"Ordered name from server: '{ordered_name}'")
+        ordered_name = clean_author_name(ordered_name)  # Clean author name after receiving from server
         if verbose:
             print(f"Ordered name after cleaning: '{ordered_name}'")
         if not valid_author_name(ordered_name) or ordered_name.lower() == "n a":
             if verbose:
                 print(f"Invalid author name format detected: '{ordered_name}', retrying...")
-            ordered_name = re.sub(r'\b(Surname|Lastname)\b', '', ordered_name, flags=re.IGNORECASE).strip()
-            if not valid_author_name(ordered_name):
-                return sort_author_names(author_names, attempt + 1, verbose=verbose)
+            return sort_author_names(author_names, attempt + 1, verbose=verbose)
         return ordered_name
     else:
         if verbose:
             print("Failed to extract a valid name, retrying...")
         return sort_author_names(author_names, attempt + 1, verbose=verbose)
-
-def send_to_ollama_server(text, filename, attempt=1, verbose=False):
-    client = OpenAI(
-        base_url="http://localhost:11434/v1/",
-        api_key="ollama"
-    )
-    base_filename = os.path.splitext(os.path.basename(filename))[0]
-    prompt = (f"Extract the first author name (ignore other authors), year of publication, and title from the following text, considering the filename '{base_filename}' which may contain clues. "
-              "I need the output in the following format: \n"
-              "<TITLE>The publication title</TITLE> \n<YEAR>2023</YEAR> \n <AUTHOR>Lastname Surname</AUTHOR> \n\n"
-              "Here is the extracted text:\n" + text)
-    messages = [{"role": "user", "content": prompt}]
-    response = client.chat.completions.create(
-        model = modelname,
-        temperature=0.7,
-        max_tokens=250,
-        messages=messages
-    )
-
-    output = response.choices[0].message.content.strip()
-    if verbose:
-        print(f"Metadata content received from server: {output}")
-
-    if ("lastname" in output.lower() or "surname" in output.lower()) and attempt < 4:
-        return send_to_ollama_server(text, filename, attempt + 1, verbose=verbose)
-    return output
 
 def send_to_ollama_server(text, filename, attempt=1, verbose=False):
     client = OpenAI(
@@ -169,25 +148,28 @@ def parse_metadata(content):
     author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content)
 
     if not title_match:
-        print (f"\nNo match for title in {content}.\n")
+        if verbose:
+            print(f"\nNo match for title in {content}.\n")
         return None
 
     if not author_match:
-        print (f"\nNo match for author in {content}.\n")
+        if verbose:
+            print(f"\nNo match for author in {content}.\n")
         return None
- 
+
     if not year_match:
         print (f"\nNo match for year in {content}. Continuing without year.\n")
 
     title = sanitize_filename(title_match.group(1).strip())
     year = sanitize_filename(year_match.group(1).strip() if year_match else "")
-    author = sanitize_filename(author_match.group(1).strip())
+    author = author_match.group(1).strip()
 
     if verbose:
         print(f"Parsed metadata - Title: '{title}', Year: '{year}', Author: '{author}'")
 
     if any(placeholder in (title.lower(), author.lower()) for placeholder in ["unknown", "n a", ""]) or year.lower() == "unknown" or year == "n a":
-        print("Error: found 'unknown' or 'n a' or '' in title, year or author!\n")
+        if verbose:
+            print("Error: found 'unknown' or 'n a' or '' in title, year or author!\n")
         return None
 
     return {'author': author, 'year': year, 'title': title}
@@ -237,6 +219,7 @@ def process_pdf(pdf_path, attempt=1, verbose=False):
             print(f"Error: Metadata parsing failed or incomplete for {pdf_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
         return process_pdf(pdf_path, attempt + 1, verbose=verbose)
 
+
 def main(directory, verbose):
     if not os.path.exists(directory):
         print("The specified directory does not exist")
@@ -252,7 +235,7 @@ def main(directory, verbose):
             try:
                 metadata = process_pdf(pdf_path, verbose=verbose)
                 if metadata:
-                    first_author = metadata['author'].split(", ")[0]
+                    first_author = sanitize_filename(metadata['author'].split(", ")[0])
                     target_dir = os.path.join(directory, first_author)
                     new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.pdf")
 

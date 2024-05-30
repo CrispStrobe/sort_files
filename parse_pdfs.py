@@ -8,27 +8,61 @@ import pytesseract
 from openai import OpenAI
 from tqdm import tqdm
 import argparse
+import threading
+import time
+import ctypes
 
 modelname = "cas/spaetzle-v60-7b"
+#modelname = "phi3:3.8b-mini-128k-instruct-q4_K_M"
 
-def extract_text_from_pdf(pdf_path):
+
+def terminate_thread(thread):
+    """Terminate a thread from another thread."""
+    if not thread.is_alive():
+        return
+
+    tid = thread.ident
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, ctypes.py_object(SystemExit))
+    if res == 0:
+        raise ValueError("Invalid thread ID")
+    elif res > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, 0)
+        raise SystemError("PyThreadState_SetAsyncExc failed")
+
+def extract_text_from_pdf(pdf_path, timeout=5):
     text = ""
-    try:
-        with open(pdf_path, 'rb') as file:
-            reader = PdfReader(file)
-            for page_num in range(min(5, len(reader.pages))):
-                page = reader.pages[page_num]
-                extracted_text = page.extract_text() or ''
-                if extracted_text:
-                    text += extracted_text
-                if len(text) > 2000:
-                    break
-    except (PdfReadError, ValueError, TypeError) as e:
-        print(f"Error extracting text from {pdf_path} with PyPDF2: {e}. Attempting OCR.")
+    def target():
+        nonlocal text
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PdfReader(file)
+                for page_num in range(min(5, len(reader.pages))):
+                    if verbose:
+                        print("reading page: ", page_num, "\n")
+                    page = reader.pages[page_num]
+                    extracted_text = page.extract_text() or ''
+                    if extracted_text:
+                        text += extracted_text
+                    if len(text) > 3000:
+                        break
+        except (PdfReadError, ValueError, TypeError) as e:
+            print(f"Error extracting text from {pdf_path} with PyPDF2: {e}.")
+            text = ""
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        print(f"Timeout extracting text from {pdf_path} with PyPDF2. Attempting OCR.")
+        terminate_thread(thread)  # Ensure thread is terminated properly
         text = ""
+        print("\ncleaned.\n")
+
     return text[:2000]
 
 def perform_ocr(pdf_path):
+    if verbose:
+       print ("performing OCR...\n")
     text = ""
     try:
         pages = convert_from_path(pdf_path, 300, first_page=1, last_page=5)
@@ -64,6 +98,8 @@ def sort_author_names(author_names, attempt=1, verbose=False):
         if verbose:
             print("Maximum retry attempts reached for sorting names.")
         return "n a"
+
+    author_names = author_names.replace('&', ',')
 
     client = OpenAI(
         base_url="http://localhost:11434/v1/",
@@ -114,6 +150,9 @@ def sort_author_names(author_names, attempt=1, verbose=False):
         return sort_author_names(author_names, attempt + 1, verbose=verbose)
 
 def send_to_ollama_server(text, filename, attempt=1, verbose=False):
+    if verbose:
+       print ("consulting ollama server on file: ", filename, " in attempt: ", attempt, "\n")
+
     client = OpenAI(
         base_url="http://localhost:11434/v1/",
         api_key="ollama"
@@ -147,6 +186,9 @@ def parse_metadata(content):
     year_match = re.search(r'<YEAR>(.*?)</YEAR>', content)
     author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content)
 
+    if verbose:
+       print ("parsing metadata:", content, "\n")
+
     if not title_match:
         if verbose:
             print(f"\nNo match for title in {content}.\n")
@@ -175,7 +217,10 @@ def parse_metadata(content):
     return {'author': author, 'year': year, 'title': title}
 
 
-def process_pdf(pdf_path, attempt=1, verbose=False):
+def process_pdf(pdf_path, attempt=1):
+    if verbose:
+        print("processing pdf:", pdf_path, " in attempt:", attempt, "\n")
+
     if attempt > 4:
         if verbose:
             print(f"Maximum retry attempts reached for {pdf_path}.")
@@ -183,13 +228,20 @@ def process_pdf(pdf_path, attempt=1, verbose=False):
 
     try:
         text = extract_text_from_pdf(pdf_path)
+        if verbose:
+           print ("returned from extraction.\n")
     except Exception as e:
         if verbose:
-            print(f"Error extracting text from {pdf_path} with PyPDF2: {e}. Attempting OCR.")
+            print(f"Error extracting text from {pdf_path} with PyPDF2: {e}. Attempting OCR next.")
         text = ""
+
+    if verbose:
+       print ("extracted text: ", text, ".\n")
 
     if not text.strip():
         try:
+            if verbose:
+                print("attempting ocr next...\n")
             text = perform_ocr(pdf_path)
         except Exception as e:
             if verbose:
@@ -197,7 +249,7 @@ def process_pdf(pdf_path, attempt=1, verbose=False):
             return None
 
     try:
-        metadata_content = send_to_ollama_server(text, pdf_path, attempt, verbose)
+        metadata_content = send_to_ollama_server(text, pdf_path, attempt)
     except Exception as e:
         if verbose:
             print(f"Error sending text to server for {pdf_path}: {e}")
@@ -205,19 +257,19 @@ def process_pdf(pdf_path, attempt=1, verbose=False):
 
     metadata = parse_metadata(metadata_content)
     if metadata:
-        corrected_authors = sort_author_names(metadata['author'], verbose=verbose)
+        corrected_authors = sort_author_names(metadata['author'])
         if verbose:
             print(f"Corrected author: '{corrected_authors}'")
         metadata['author'] = corrected_authors
         if not valid_author_name(metadata['author']):
             if verbose:
                 print(f"Author's name still invalid after sorting, retrying for {pdf_path}. Attempt {attempt}")
-            return process_pdf(pdf_path, attempt + 1, verbose=verbose)
+            return process_pdf(pdf_path, attempt + 1)
         return metadata
     else:
         if verbose:
             print(f"Error: Metadata parsing failed or incomplete for {pdf_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
-        return process_pdf(pdf_path, attempt + 1, verbose=verbose)
+        return process_pdf(pdf_path, attempt + 1)
 
 
 def main(directory, verbose):
@@ -233,7 +285,7 @@ def main(directory, verbose):
         for filename in tqdm(pdf_files):
             pdf_path = os.path.join(directory, filename)
             try:
-                metadata = process_pdf(pdf_path, verbose=verbose)
+                metadata = process_pdf(pdf_path)
                 if metadata:
                     first_author = sanitize_filename(metadata['author'].split(", ")[0])
                     target_dir = os.path.join(directory, first_author)

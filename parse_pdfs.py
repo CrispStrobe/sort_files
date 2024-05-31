@@ -9,12 +9,14 @@ from openai import OpenAI
 from tqdm import tqdm
 import argparse
 import threading
-import time
 import ctypes
+from ebooklib import epub
+from bs4 import BeautifulSoup
 
 modelname = "cas/spaetzle-v60-7b"
-#modelname = "phi3:3.8b-mini-128k-instruct-q4_K_M"
+#modelname = "cas/llama3-8b-spaetzle-v20"
 
+verbose = False
 
 def terminate_thread(thread):
     """Terminate a thread from another thread."""
@@ -60,9 +62,24 @@ def extract_text_from_pdf(pdf_path, timeout=5):
 
     return text[:2000]
 
+def extract_text_from_epub(epub_path):
+    text = ""
+    try:
+        book = epub.read_epub(epub_path)
+        for item in book.get_items():
+            if item.media_type == 'application/xhtml+xml':
+                soup = BeautifulSoup(item.get_body_content(), 'html.parser')
+                text += soup.get_text(separator="\n")
+                if len(text) > 3000:
+                    break
+    except Exception as e:
+        print(f"Error extracting text from {epub_path} with EbookLib: {e}")
+    return text[:2000]
+
+
 def perform_ocr(pdf_path):
     if verbose:
-       print ("performing OCR...\n")
+       print("performing OCR...\n")
     text = ""
     try:
         pages = convert_from_path(pdf_path, 300, first_page=1, last_page=5)
@@ -151,7 +168,7 @@ def sort_author_names(author_names, attempt=1, verbose=False):
 
 def send_to_ollama_server(text, filename, attempt=1, verbose=False):
     if verbose:
-       print ("consulting ollama server on file: ", filename, " in attempt: ", attempt, "\n")
+       print("consulting ollama server on file:", filename, "in attempt:", attempt, "\n")
 
     client = OpenAI(
         base_url="http://localhost:11434/v1/",
@@ -182,12 +199,13 @@ def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).replace('/', '')
 
 def parse_metadata(content):
+    global verbose
     title_match = re.search(r'<TITLE>(.*?)</TITLE>', content)
     year_match = re.search(r'<YEAR>(.*?)</YEAR>', content)
     author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content)
 
     if verbose:
-       print ("parsing metadata:", content, "\n")
+       print("parsing metadata:", content, "\n")
 
     if not title_match:
         if verbose:
@@ -200,7 +218,7 @@ def parse_metadata(content):
         return None
 
     if not year_match:
-        print (f"\nNo match for year in {content}. Continuing without year.\n")
+        print(f"\nNo match for year in {content}. Continuing without year.\n")
 
     title = sanitize_filename(title_match.group(1).strip())
     year = sanitize_filename(year_match.group(1).strip() if year_match else "")
@@ -216,43 +234,51 @@ def parse_metadata(content):
 
     return {'author': author, 'year': year, 'title': title}
 
-
-def process_pdf(pdf_path, attempt=1):
+def process_file(file_path, attempt=1):
     if verbose:
-        print("processing pdf:", pdf_path, " in attempt:", attempt, "\n")
+        print("processing file:", file_path, " in attempt:", attempt, "\n")
 
     if attempt > 4:
         if verbose:
-            print(f"Maximum retry attempts reached for {pdf_path}.")
+            print(f"Maximum retry attempts reached for {file_path}.")
         return None
 
     try:
-        text = extract_text_from_pdf(pdf_path)
+        if file_path.lower().endswith('.pdf'):
+            text = extract_text_from_pdf(file_path)
+        elif file_path.lower().endswith('.epub'):
+            text = extract_text_from_epub(file_path)
+        else:
+            if verbose:
+                print(f"Unsupported file format for {file_path}.")
+            return None
+
         if verbose:
-           print ("returned from extraction.\n")
+           print("returned from extraction.\n")
     except Exception as e:
         if verbose:
-            print(f"Error extracting text from {pdf_path} with PyPDF2: {e}. Attempting OCR next.")
+            print(f"Error extracting text from {file_path}: {e}. Attempting OCR next.")
         text = ""
 
     if verbose:
-       print ("extracted text: ", text, ".\n")
+       print("extracted text: ", text, ".\n")
 
     if not text.strip():
-        try:
-            if verbose:
-                print("attempting ocr next...\n")
-            text = perform_ocr(pdf_path)
-        except Exception as e:
-            if verbose:
-                print(f"Error extracting text from {pdf_path} with OCR: {e}")
-            return None
+        if file_path.lower().endswith('.pdf'):
+            try:
+                if verbose:
+                    print("attempting ocr next...\n")
+                text = perform_ocr(file_path)
+            except Exception as e:
+                if verbose:
+                    print(f"Error extracting text from {file_path} with OCR: {e}")
+                return None
 
     try:
-        metadata_content = send_to_ollama_server(text, pdf_path, attempt)
+        metadata_content = send_to_ollama_server(text, file_path, attempt)
     except Exception as e:
         if verbose:
-            print(f"Error sending text to server for {pdf_path}: {e}")
+            print(f"Error sending text to server for {file_path}: {e}")
         return None
 
     metadata = parse_metadata(metadata_content)
@@ -263,48 +289,47 @@ def process_pdf(pdf_path, attempt=1):
         metadata['author'] = corrected_authors
         if not valid_author_name(metadata['author']):
             if verbose:
-                print(f"Author's name still invalid after sorting, retrying for {pdf_path}. Attempt {attempt}")
-            return process_pdf(pdf_path, attempt + 1)
+                print(f"Author's name still invalid after sorting, retrying for {file_path}. Attempt {attempt}")
+            return process_file(file_path, attempt + 1)
         return metadata
     else:
         if verbose:
-            print(f"Error: Metadata parsing failed or incomplete for {pdf_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
-        return process_pdf(pdf_path, attempt + 1)
-
+            print(f"Error: Metadata parsing failed or incomplete for {file_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
+        return process_file(file_path, attempt + 1)
 
 def main(directory, verbose):
     if not os.path.exists(directory):
         print("The specified directory does not exist")
         sys.exit(1)
 
-    pdf_files = [f for f in os.listdir(directory) if f.endswith(".pdf")]
+    files = [f for f in os.listdir(directory) if f.lower().endswith(('.pdf', '.epub'))]
 
     with open("rename_commands.sh", "w") as mv_file, open("unparseables.lst", "w") as unparseable_file:
         mv_file.write("#!/bin/sh\n")
         mv_file.flush()
-        for filename in tqdm(pdf_files):
-            pdf_path = os.path.join(directory, filename)
+        for filename in tqdm(files):
+            file_path = os.path.join(directory, filename)
             try:
-                metadata = process_pdf(pdf_path)
+                metadata = process_file(file_path)
                 if metadata:
                     first_author = sanitize_filename(metadata['author'].split(", ")[0])
                     target_dir = os.path.join(directory, first_author)
-                    new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.pdf")
+                    new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
 
                     mv_file.write(f"mkdir -p \"{target_dir}\"\n")
-                    mv_file.write(f"mv \"{pdf_path}\" \"{new_file_path}\"\n")
+                    mv_file.write(f"mv \"{file_path}\" \"{new_file_path}\"\n")
                     mv_file.flush()
                 else:
-                    unparseable_file.write(f"{pdf_path}\n")
+                    unparseable_file.write(f"{file_path}\n")
                     unparseable_file.flush()
             except Exception as e:
-                print(f"Failed to process {pdf_path}: {e}")
-                unparseable_file.write(f"{pdf_path}\n")
+                print(f"Failed to process {file_path}: {e}")
+                unparseable_file.write(f"{file_path}\n")
                 unparseable_file.flush()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parse PDFs and extract metadata.")
-    parser.add_argument("directory", help="Directory containing PDF files")
+    parser = argparse.ArgumentParser(description="Parse PDFs and EPUBs and extract metadata.")
+    parser.add_argument("directory", help="Directory containing PDF and EPUB files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 

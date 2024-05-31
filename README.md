@@ -41,6 +41,13 @@ This command sorts all PDFs in the current directory with verbose output enabled
 python parse_pdfs.py ./
 ```
 
+Note that the results will naturally be imperfect. Therefore, the renaming is not done automatically. Rather, a script "rename_commands.sh" is created. You should check it manually for inconsistencies (you can just delete or edit those). And then make that shell script executable and start it:
+
+```bash
+chmod +x ./rename_commands.sh
+./rename_commands.sh 
+```
+
 ### Optional Arguments
 
 - `--verbose`: Enable verbose output for debugging.

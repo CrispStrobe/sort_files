@@ -12,15 +12,18 @@ This quickly hacked Python script organizes all PDFs and EPUBs in a given direct
 ## Requirements
 
 - **Python**: Ensure Python is installed on your system.
-- **Python Libraries**: Requires specific libraries which can be installed via pip:
+- **Python Libraries and System Dependencies**: The script requires specific python libraries which can be installed via pip:
   ```bash
   pip install PyPDF2 pdf2image pytesseract tqdm openai EbookLib
   ```
-- **System Dependencies**:
-  - **Poppler and Tesseract**: Necessary for PDF to image conversion and OCR functionality.
-    ```bash
-    sudo apt-get install poppler-utils tesseract-ocr tesseract-ocr-eng 
-    ```
+  Also, Poppler and Tesseract are necessary for PDF to image conversion and OCR functionality:
+  ```bash
+  sudo apt-get install poppler-utils tesseract-ocr tesseract-ocr-eng 
+  ```
+  For **Windows** (without WSL), there is an extra version. For it to work, install some alternative libraries: 
+  ```terminal
+  pip install PyPDF2 pytesseract pymupdf openai tqdm ebooklib beautifulsoup4
+  ```
 - **Ollama Setup**:
   - **Model Installation**: The script uses a local Ollama instance with a specific LLM model. The default is `cas/spaetzle-v60-7b`, suitable for English and German text. Change the model as per your requirements.
     ```bash

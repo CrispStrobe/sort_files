@@ -48,8 +48,10 @@ Note that the results will naturally be imperfect. Therefore, the renaming is no
 
 ```bash
 chmod +x ./rename_commands.sh
-./rename_commands.sh 
+./rename_commands.sh
 ```
+
+The **Windows** script generates a batch script "rename_commands.bat" which you would have to manually check and execute - unless you choose to risk to skip this step, then you can pass the parameter "--rename-directly". This is unsafe und not recommended though!
 
 ### Optional Arguments
 

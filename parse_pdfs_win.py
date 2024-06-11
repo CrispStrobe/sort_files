@@ -299,40 +299,64 @@ def process_file(file_path, attempt=1):
             print(f"Error: Metadata parsing failed or incomplete for {file_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
         return process_file(file_path, attempt + 1)
 
-def main(directory, verbose):
+def main(directory, verbose, rename_directly):
     if not os.path.exists(directory):
         print("The specified directory does not exist")
         sys.exit(1)
 
     files = [f for f in os.listdir(directory) if f.lower().endswith(('.pdf', '.epub'))]
 
-    for filename in tqdm(files):
-        file_path = os.path.join(directory, filename)
-        try:
-            metadata = process_file(file_path)
-            if metadata:
-                first_author = sanitize_filename(metadata['author'].split(", ")[0])
-                target_dir = os.path.join(directory, first_author)
-                new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
+    if rename_directly:
+        for filename in tqdm(files):
+            file_path = os.path.join(directory, filename)
+            try:
+                metadata = process_file(file_path)
+                if metadata:
+                    first_author = sanitize_filename(metadata['author'].split(", ")[0])
+                    target_dir = os.path.join(directory, first_author)
+                    new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
 
-                if not os.path.exists(target_dir):
-                    os.makedirs(target_dir)
-                shutil.move(file_path, new_file_path)
-            else:
+                    if not os.path.exists(target_dir):
+                        os.makedirs(target_dir)
+                    shutil.move(file_path, new_file_path)
+                else:
+                    with open("unparseables.lst", "a") as unparseable_file:
+                        unparseable_file.write(f"{file_path}\n")
+            except Exception as e:
+                print(f"Failed to process {file_path}: {e}")
                 with open("unparseables.lst", "a") as unparseable_file:
                     unparseable_file.write(f"{file_path}\n")
-        except Exception as e:
-            print(f"Failed to process {file_path}: {e}")
-            with open("unparseables.lst", "a") as unparseable_file:
-                unparseable_file.write(f"{file_path}\n")
+    else:
+        with open("rename_commands.bat", "w") as mv_file, open("unparseables.lst", "w") as unparseable_file:
+            for filename in tqdm(files):
+                file_path = os.path.join(directory, filename)
+                try:
+                    metadata = process_file(file_path)
+                    if metadata:
+                        first_author = sanitize_filename(metadata['author'].split(", ")[0])
+                        target_dir = os.path.join(directory, first_author)
+                        new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
+
+                        mv_file.write(f'mkdir "{target_dir}" 2>nul\n')
+                        mv_file.write(f'move "{file_path}" "{new_file_path}"\n')
+                        mv_file.flush()
+                    else:
+                        unparseable_file.write(f"{file_path}\n")
+                        unparseable_file.flush()
+                except Exception as e:
+                    print(f"Failed to process {file_path}: {e}")
+                    unparseable_file.write(f"{file_path}\n")
+                    unparseable_file.flush()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse PDFs and EPUBs and extract metadata.")
     parser.add_argument("directory", help="Directory containing PDF and EPUB files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--rename-directly", action="store_true", help="Rename files directly instead of writing commands to a batch file")
     args = parser.parse_args()
 
     DIRECTORY = args.directory
     verbose = args.verbose
+    rename_directly = args.rename_directly
 
-    main(DIRECTORY, verbose)
+    main(DIRECTORY, verbose, rename_directly)

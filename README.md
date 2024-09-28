@@ -1,6 +1,6 @@
 # Document Sorting Script
 
-This Python script organizes various document types in a given directory by parsing their content. It moves each file into a directory named after the first author (formatted as "Lastname Surname") and renames the file in the format "year title.extension".
+This Python script invokes a local [ollama](https://github.com/ollama/ollama) instance to organize various document types in a given directory by parsing their content. It moves each file into a directory named after the first author (formatted as "Lastname Surname") and renames the file in the format "year title.extension".
 
 ## Features
 
@@ -30,7 +30,7 @@ This Python script organizes various document types in a given directory by pars
   ```
 
 - **Ollama Setup**:
-  - **Model Installation**: The script uses a local Ollama instance with a specific LLM model. The default is `cas/spaetzle-v85-7b`, suitable for English and German text. Change the model as per your requirements.
+  - **Model Installation**: The script uses a local Ollama instance with a specific LLM model. The default is `cas/spaetzle-v85-7b`, suitable for English and German text. Change the model as per your requirements. (Of course you could easily invoke any other OpenAI protocol compatible API.)
     ```bash
     ollama pull cas/spaetzle-v85-7b
     ```

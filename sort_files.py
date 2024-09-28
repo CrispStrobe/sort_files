@@ -12,9 +12,13 @@ import threading
 import ctypes
 from ebooklib import epub
 from bs4 import BeautifulSoup
+import docx
+import mobi
+import shutil
+import textract
 
-modelname = "cas/spaetzle-v60-7b"
-#modelname = "cas/llama3-8b-spaetzle-v20"
+modelname = "cas/spaetzle-v85-7b"
+#modelname = "cas/llama3.1-8b-spaetzle-v109"
 
 verbose = False
 
@@ -30,6 +34,42 @@ def terminate_thread(thread):
     elif res > 1:
         ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, 0)
         raise SystemError("PyThreadState_SetAsyncExc failed")
+
+# we could also use textract for docx, but sometimes this might work better
+def extract_text_from_docx(docx_path):
+    text = ""
+    try:
+        doc = docx.Document(docx_path)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+            if len(text) > 3000:
+                break
+    except Exception as e:
+        print(f"Error extracting text from {docx_path}: {e}")
+    return text[:2000]
+
+def extract_text_from_mobi(mobi_path):
+    text = ""
+    try:
+        tempdir, filepath = mobi.extract(mobi_path)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+        shutil.rmtree(tempdir)
+    except Exception as e:
+        print(f"Error extracting text from {mobi_path} using mobi library: {e}")
+        print("Attempting to use EbookLib for MOBI extraction...")
+        try:
+            # Fallback to using EbookLib
+            book = epub.read_epub(mobi_path)
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    text += soup.get_text() + "\n"
+                if len(text) > 3000:
+                    break
+        except Exception as inner_e:
+            print(f"Error extracting text from {mobi_path} using EbookLib: {inner_e}")
+    return text[:2000]
 
 def extract_text_from_pdf(pdf_path, timeout=5):
     text = ""
@@ -62,6 +102,14 @@ def extract_text_from_pdf(pdf_path, timeout=5):
 
     return text[:2000]
 
+def extract_text_with_textract(file_path):
+    try:
+        text = textract.process(file_path).decode('utf-8')
+        return text[:2000]
+    except Exception as e:
+        print(f"Error extracting text from {file_path} with textract: {e}")
+        return ""
+
 def extract_text_from_epub(epub_path):
     text = ""
     try:
@@ -75,7 +123,6 @@ def extract_text_from_epub(epub_path):
     except Exception as e:
         print(f"Error extracting text from {epub_path} with EbookLib: {e}")
     return text[:2000]
-
 
 def perform_ocr(pdf_path):
     if verbose:
@@ -248,6 +295,14 @@ def process_file(file_path, attempt=1):
             text = extract_text_from_pdf(file_path)
         elif file_path.lower().endswith('.epub'):
             text = extract_text_from_epub(file_path)
+        elif file_path.lower().endswith('.docx'):
+            text = extract_text_from_docx(file_path)
+        elif file_path.lower().endswith(('.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+                                         '.odt', '.ods', '.odp', '.jpg', '.jpeg', '.png', 
+                                         '.gif', '.html', '.xml', '.rtf', '.md', '.txt')):
+            text = extract_text_with_textract(file_path)
+        elif file_path.lower().endswith('.mobi'):
+            text = extract_text_from_mobi(file_path)
         else:
             if verbose:
                 print(f"Unsupported file format for {file_path}.")
@@ -302,7 +357,11 @@ def main(directory, verbose):
         print("The specified directory does not exist")
         sys.exit(1)
 
-    files = [f for f in os.listdir(directory) if f.lower().endswith(('.pdf', '.epub'))]
+    supported_extensions = ('.pdf', '.epub', '.docx', '.doc', '.xls', '.xlsx', '.ppt', '.pptx', 
+                            '.odt', '.ods', '.odp', '.jpg', '.jpeg', '.png', '.gif', '.html', 
+                            '.xml', '.rtf', '.md', '.txt', '.mobi')
+    
+    files = [f for f in os.listdir(directory) if f.lower().endswith(supported_extensions)]
 
     with open("rename_commands.sh", "w") as mv_file, open("unparseables.lst", "w") as unparseable_file:
         mv_file.write("#!/bin/sh\n")

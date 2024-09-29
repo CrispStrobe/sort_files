@@ -16,6 +16,8 @@ import docx
 import mobi
 import shutil
 import textract
+import subprocess
+import tempfile
 
 modelname = "cas/spaetzle-v85-7b"
 #modelname = "cas/llama3.1-8b-spaetzle-v109"
@@ -50,25 +52,98 @@ def extract_text_from_docx(docx_path):
 
 def extract_text_from_mobi(mobi_path):
     text = ""
+    
+    # First attempt: Use textract
     try:
-        tempdir, filepath = mobi.extract(mobi_path)
-        with open(filepath, 'r', encoding='utf-8') as f:
-            text = f.read()
-        shutil.rmtree(tempdir)
+        text = textract.process(mobi_path).decode('utf-8')
+        if text.strip():
+            return text[:2000]
     except Exception as e:
-        print(f"Error extracting text from {mobi_path} using mobi library: {e}")
+        print(f"Error extracting text from {mobi_path} using textract: {e}")
+    
+    # Second attempt: Use ebooklib
+    if not text:
         print("Attempting to use EbookLib for MOBI extraction...")
         try:
-            # Fallback to using EbookLib
             book = epub.read_epub(mobi_path)
             for item in book.get_items():
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
                     soup = BeautifulSoup(item.get_content(), 'html.parser')
                     text += soup.get_text() + "\n"
-                if len(text) > 3000:
-                    break
-        except Exception as inner_e:
-            print(f"Error extracting text from {mobi_path} using EbookLib: {inner_e}")
+                    if len(text) > 3000:
+                        break
+            if text.strip():
+                return text[:2000]
+        except Exception as e:
+            print(f"Error extracting text from {mobi_path} using EbookLib: {e}")
+    
+    # Third attempt: Use mobi library
+    if not text:
+        print("Attempting to use mobi library for MOBI extraction...")
+        try:
+            tempdir, filepath = mobi.extract(mobi_path)
+            with open(filepath, 'r', encoding='utf-8') as f:
+                text = f.read()
+            shutil.rmtree(tempdir)
+        except Exception as e:
+            print(f"Error extracting text from {mobi_path} using mobi library: {e}")
+    
+    return text[:2000]
+
+def extract_text_from_djvu(djvu_path):
+    try:
+        result = subprocess.run(['djvutxt', djvu_path], capture_output=True, text=True, check=True)
+        return result.stdout[:2000]  # Return the first 2000 characters
+    except subprocess.CalledProcessError as e:
+        print(f"Error extracting text from {djvu_path}: {e}")
+        return ""
+    except FileNotFoundError:
+        print("djvutxt command not found. Please install DjVuLibre package.")
+        return ""
+
+def extract_text_from_azw(azw_path):
+    text = ""
+    
+    # First attempt: Use textract
+    try:
+        text = textract.process(azw_path).decode('utf-8')
+        if text.strip():
+            return text[:2000]
+    except Exception as e:
+        if verbose:
+            print(f"Error extracting text from {azw_path} using textract: {e}")
+    
+    # Second attempt: Use ebooklib
+    if not text:
+        if verbose:
+            print("Attempting to use EbookLib for AZW extraction...")
+        try:
+            book = epub.read_epub(azw_path)
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    soup = BeautifulSoup(item.get_content(), 'html.parser')
+                    text += soup.get_text() + "\n"
+                    if len(text) > 3000:
+                        break
+            if text.strip():
+                return text[:2000]
+        except Exception as e:
+            if verbose:
+                print(f"Error extracting text from {azw_path} using EbookLib: {e}")
+    
+    # Third attempt: Use mobi library
+    if not text:
+        if verbose:
+            print("Attempting to use mobi library for AZW extraction...")
+        try:
+            tempdir, filepath = mobi.extract(azw_path)
+            with open(filepath, 'r', encoding='utf-8') as f:
+                text = f.read()
+            shutil.rmtree(tempdir)
+        except Exception as e:
+            if verbose:
+                print(f"Error extracting text from {azw_path} using mobi library: {e}")
+    
     return text[:2000]
 
 def extract_text_from_pdf(pdf_path, timeout=5):
@@ -122,6 +197,11 @@ def extract_text_from_epub(epub_path):
                     break
     except Exception as e:
         print(f"Error extracting text from {epub_path} with EbookLib: {e}")
+        print("Attempting to use textract for EPUB extraction...")
+        try:
+            text = extract_text_with_textract(epub_path)
+        except Exception as inner_e:
+            print(f"Error extracting text from {epub_path} using textract: {inner_e}")
     return text[:2000]
 
 def perform_ocr(pdf_path):
@@ -297,7 +377,11 @@ def process_file(file_path, attempt=1):
             text = extract_text_from_epub(file_path)
         elif file_path.lower().endswith('.docx'):
             text = extract_text_from_docx(file_path)
-        elif file_path.lower().endswith(('.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+        elif file_path.lower().endswith(('.azw', '.azw3')):
+            text = extract_text_from_azw(file_path)
+        elif file_path.lower().endswith('.djvu'):
+            text = extract_text_from_djvu(file_path)
+        elif file_path.lower().endswith(('.doc', '.xls', '.xlsx', '.ppt', '.pptx', 
                                          '.odt', '.ods', '.odp', '.jpg', '.jpeg', '.png', 
                                          '.gif', '.html', '.xml', '.rtf', '.md', '.txt')):
             text = extract_text_with_textract(file_path)
@@ -319,7 +403,7 @@ def process_file(file_path, attempt=1):
        print("extracted text: ", text, ".\n")
 
     if not text.strip():
-        if file_path.lower().endswith('.pdf'):
+        if file_path.lower().endswith(('.pdf', '.djvu')):
             try:
                 if verbose:
                     print("attempting ocr next...\n")
@@ -352,47 +436,75 @@ def process_file(file_path, attempt=1):
             print(f"Error: Metadata parsing failed or incomplete for {file_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
         return process_file(file_path, attempt + 1)
 
-def main(directory, verbose):
+def execute_rename_commands(script_path):
+    try:
+        subprocess.run(['bash', script_path], check=True)
+        print(f"Successfully executed rename commands from {script_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing rename commands: {e}")
+    except Exception as e:
+        print(f"Unexpected error during rename command execution: {e}")
+
+def main(directory, verbose, force):
     if not os.path.exists(directory):
         print("The specified directory does not exist")
         sys.exit(1)
 
     supported_extensions = ('.pdf', '.epub', '.docx', '.doc', '.xls', '.xlsx', '.ppt', '.pptx', 
                             '.odt', '.ods', '.odp', '.jpg', '.jpeg', '.png', '.gif', '.html', 
-                            '.xml', '.rtf', '.md', '.txt', '.mobi')
+                            '.xml', '.rtf', '.md', '.txt', '.mobi', '.azw', '.azw3', '.djvu')
     
     files = [f for f in os.listdir(directory) if f.lower().endswith(supported_extensions)]
 
-    with open("rename_commands.sh", "w") as mv_file, open("unparseables.lst", "w") as unparseable_file:
-        mv_file.write("#!/bin/sh\n")
+    rename_script_path = "rename_commands.sh"
+    with open(rename_script_path, "w") as mv_file:
+        mv_file.write("#!/bin/bash\n")
         mv_file.flush()
-        for filename in tqdm(files):
-            file_path = os.path.join(directory, filename)
-            try:
-                metadata = process_file(file_path)
-                if metadata:
-                    first_author = sanitize_filename(metadata['author'].split(", ")[0])
-                    target_dir = os.path.join(directory, first_author)
-                    new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
 
+    for filename in tqdm(files):
+        file_path = os.path.join(directory, filename)
+        try:
+            metadata = process_file(file_path)
+            if metadata:
+                first_author = sanitize_filename(metadata['author'].split(", ")[0])
+                target_dir = os.path.join(directory, first_author)
+                new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
+
+                with open(rename_script_path, "a") as mv_file:
                     mv_file.write(f"mkdir -p \"{target_dir}\"\n")
                     mv_file.write(f"mv \"{file_path}\" \"{new_file_path}\"\n")
                     mv_file.flush()
-                else:
+            else:
+                with open("unparseables.lst", "a") as unparseable_file:
                     unparseable_file.write(f"{file_path}\n")
                     unparseable_file.flush()
-            except Exception as e:
-                print(f"Failed to process {file_path}: {e}")
+        except Exception as e:
+            print(f"Failed to process {file_path}: {e}")
+            with open("unparseables.lst", "a") as unparseable_file:
                 unparseable_file.write(f"{file_path}\n")
                 unparseable_file.flush()
 
+    # Make rename_commands.sh executable
+    os.chmod(rename_script_path, 0o755)
+
+    print(f"\nRename commands have been written to {rename_script_path}")
+    print("Please review the commands before executing them.")
+
+    if force:
+        print("Force option detected. Executing rename commands...")
+        execute_rename_commands(rename_script_path)
+    else:
+        print(f"To execute the rename commands, run: bash {rename_script_path}")
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parse PDFs and EPUBs and extract metadata.")
-    parser.add_argument("directory", help="Directory containing PDF and EPUB files")
+    parser = argparse.ArgumentParser(description="Parse PDFs, EPUBs, and other document formats to extract metadata.")
+    parser.add_argument("directory", help="Directory containing document files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--force", action="store_true", help="Automatically execute rename commands")
     args = parser.parse_args()
 
     DIRECTORY = args.directory
     verbose = args.verbose
+    force = args.force
 
-    main(DIRECTORY, verbose)
+    main(DIRECTORY, verbose, force)

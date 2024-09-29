@@ -133,20 +133,7 @@ def extract_text_from_azw(azw_path, verbose=False):
         print(f"Extracting text from AZW: {azw_path}")
     text = ""
     
-    # First attempt: Use textract
-    if verbose:
-        print("Attempting to use textract for AZW extraction...")
-    try:
-        text = textract.process(azw_path).decode('utf-8')
-        if text.strip():
-            if verbose:
-                print(f"Successfully extracted text using textract ({len(text)} characters)")
-            return text[:2000]
-    except Exception as e:
-        if verbose:
-            print(f"Error extracting text from {azw_path} using textract: {e}")
-    
-    # Second attempt: Use ebooklib
+    # first attempt: Use ebooklib
     if not text:
         if verbose:
             print("Attempting to use EbookLib for AZW extraction...")
@@ -166,7 +153,7 @@ def extract_text_from_azw(azw_path, verbose=False):
             if verbose:
                 print(f"Error extracting text from {azw_path} using EbookLib: {e}")
     
-    # Third attempt: Use mobi library
+    # second attempt: Use mobi library
     if not text:
         if verbose:
             print("Attempting to use mobi library for AZW extraction...")

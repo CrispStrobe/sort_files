@@ -61,25 +61,21 @@ chmod +x ./rename_commands.sh
 - The script retries metadata extraction multiple times to ensure accuracy, especially for author names.
 - Files that cannot be parsed are listed in "unparseables.lst".
 - Customize the script's model or configurations as necessary to fit your specific needs.
-- For AZW and AZW3 files, the script uses multiple methods (mobi library, ebooklib, and textract) to attempt text extraction.
+- For some filetapes, the script uses multiple methods (mobi library, ebooklib, and textract) to attempt text extraction.
 
 ## Limitations
 
 - The script assumes it has read access to all files and write access to create new directories and files.
 - For very large files, the script might be slow or use a lot of memory as it loads entire files into memory.
 - The accuracy of metadata extraction depends on the quality of the input files and the capabilities of the Ollama model used.
-- AZW3 files are not supported by textract, so the script relies on other methods for these files.
 
 ## Troubleshooting
 
 - If you encounter issues with specific file formats, ensure you have the necessary libraries and system dependencies installed.
-- For AZW3 files, make sure you have the `mobi` and `ebooklib` Python packages installed.
-- If Ollama server communication fails, check that the server is running and accessible at `http://localhost:11434/v1/`.
+- Make sure you have the relevant Python packages, like `mobi` and `ebooklib`, installed.
+- If Ollama server communication fails, check that the server is running and accessible at `http://localhost:11434/v1/`, or change that in the script according to your setup.
 
 ## Contributing
 
 Contributions, bug reports, and feature requests are welcome! Please open an issue or submit a pull request on the project repository.
 
-## License
-
-[Specify your license here, e.g., MIT, GPL, etc.]

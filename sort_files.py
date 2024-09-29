@@ -372,7 +372,34 @@ def send_to_ollama_server(text, filename, attempt=1, verbose=False):
     return output
 
 def sanitize_filename(name):
-    return re.sub(r'[\\/*?:"<>|]', "", name).replace('/', '')
+    # Remove problematic characters
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    
+    # Handle author name specific cases
+    if " " in name:  # Only apply these rules if the name has spaces (likely an author name)
+        # Remove all dots after letters
+        name = re.sub(r'(\w)\.', r'\1', name)
+        
+        # Combine single letters, handling recurrent occurrences
+        parts = name.split()
+        new_parts = []
+        current_initials = ""
+        
+        for part in parts:
+            if len(part) == 1:
+                current_initials += part
+            else:
+                if current_initials:
+                    new_parts.append(current_initials)
+                    current_initials = ""
+                new_parts.append(part)
+        
+        if current_initials:
+            new_parts.append(current_initials)
+        
+        name = " ".join(new_parts)
+    
+    return name.strip().replace('/', '')
 
 def parse_metadata(content, verbose=False):
 
@@ -496,6 +523,9 @@ def execute_rename_commands(script_path):
     except Exception as e:
         print(f"Unexpected error during rename command execution: {e}")
 
+def escape_special_chars(filename):
+    return re.sub(r'([$`"\\])', r'\\\1', filename)
+
 def main(directory, verbose, force):
     if not os.path.exists(directory):
         print("The specified directory does not exist")
@@ -510,6 +540,7 @@ def main(directory, verbose, force):
     rename_script_path = "rename_commands.sh"
     with open(rename_script_path, "w") as mv_file:
         mv_file.write("#!/bin/bash\n")
+        mv_file.write('set -e\n')  # Exit on error
         mv_file.flush()
 
     for filename in tqdm(files, disable=not verbose):
@@ -521,11 +552,16 @@ def main(directory, verbose, force):
             if metadata:
                 first_author = sanitize_filename(metadata['author'].split(", ")[0])
                 target_dir = os.path.join(directory, first_author)
-                new_file_path = os.path.join(target_dir, f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}")
+                new_filename = f"{metadata['year']} {sanitize_filename(metadata['title'])}.{filename.split('.')[-1]}"
+                new_file_path = os.path.join(target_dir, new_filename)
 
                 with open(rename_script_path, "a") as mv_file:
-                    mv_file.write(f"mkdir -p \"{target_dir}\"\n")
-                    mv_file.write(f"mv \"{file_path}\" \"{new_file_path}\"\n")
+                    escaped_file_path = escape_special_chars(file_path)
+                    escaped_target_dir = escape_special_chars(target_dir)
+                    escaped_new_file_path = escape_special_chars(new_file_path)
+                    
+                    mv_file.write(f"mkdir -p \"{escaped_target_dir}\"\n")
+                    mv_file.write(f"mv \"{escaped_file_path}\" \"{escaped_new_file_path}\"\n")
                     mv_file.flush()
                 if verbose:
                     print(f"Rename command added for: {file_path}")

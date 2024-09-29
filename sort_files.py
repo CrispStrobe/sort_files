@@ -38,7 +38,9 @@ def terminate_thread(thread):
         raise SystemError("PyThreadState_SetAsyncExc failed")
 
 # we could also use textract for docx, but sometimes this might work better
-def extract_text_from_docx(docx_path):
+def extract_text_from_docx(docx_path, verbose=False):
+    if verbose:
+        print(f"Extracting text from DOCX: {docx_path}")
     text = ""
     try:
         doc = docx.Document(docx_path)
@@ -46,24 +48,35 @@ def extract_text_from_docx(docx_path):
             text += para.text + "\n"
             if len(text) > 3000:
                 break
+        if verbose:
+            print(f"Extracted {len(text)} characters from DOCX")
     except Exception as e:
-        print(f"Error extracting text from {docx_path}: {e}")
+        if verbose:
+            print(f"Error extracting text from {docx_path}: {e}")
     return text[:2000]
 
-def extract_text_from_mobi(mobi_path):
+def extract_text_from_mobi(mobi_path, verbose=False):
+    if verbose:
+        print(f"Extracting text from MOBI: {mobi_path}")
     text = ""
     
     # First attempt: Use textract
+    if verbose:
+        print("Attempting to use textract for MOBI extraction...")
     try:
         text = textract.process(mobi_path).decode('utf-8')
         if text.strip():
+            if verbose:
+                print(f"Successfully extracted text using textract ({len(text)} characters)")
             return text[:2000]
     except Exception as e:
-        print(f"Error extracting text from {mobi_path} using textract: {e}")
+        if verbose:
+            print(f"Error extracting text from {mobi_path} using textract: {e}")
     
     # Second attempt: Use ebooklib
     if not text:
-        print("Attempting to use EbookLib for MOBI extraction...")
+        if verbose:
+            print("Attempting to use EbookLib for MOBI extraction...")
         try:
             book = epub.read_epub(mobi_path)
             for item in book.get_items():
@@ -73,41 +86,61 @@ def extract_text_from_mobi(mobi_path):
                     if len(text) > 3000:
                         break
             if text.strip():
+                if verbose:
+                    print(f"Successfully extracted text using EbookLib ({len(text)} characters)")
                 return text[:2000]
         except Exception as e:
-            print(f"Error extracting text from {mobi_path} using EbookLib: {e}")
+            if verbose:
+                print(f"Error extracting text from {mobi_path} using EbookLib: {e}")
     
     # Third attempt: Use mobi library
     if not text:
-        print("Attempting to use mobi library for MOBI extraction...")
+        if verbose:
+            print("Attempting to use mobi library for MOBI extraction...")
         try:
             tempdir, filepath = mobi.extract(mobi_path)
             with open(filepath, 'r', encoding='utf-8') as f:
                 text = f.read()
             shutil.rmtree(tempdir)
+            if verbose:
+                print(f"Successfully extracted text using mobi library ({len(text)} characters)")
         except Exception as e:
-            print(f"Error extracting text from {mobi_path} using mobi library: {e}")
+            if verbose:
+                print(f"Error extracting text from {mobi_path} using mobi library: {e}")
     
     return text[:2000]
 
-def extract_text_from_djvu(djvu_path):
+def extract_text_from_djvu(djvu_path, verbose=False):
+    if verbose:
+        print(f"Extracting text from DJVU: {djvu_path}")
     try:
         result = subprocess.run(['djvutxt', djvu_path], capture_output=True, text=True, check=True)
-        return result.stdout[:2000]  # Return the first 2000 characters
+        text = result.stdout[:2000]
+        if verbose:
+            print(f"Successfully extracted {len(text)} characters from DJVU")
+        return text
     except subprocess.CalledProcessError as e:
-        print(f"Error extracting text from {djvu_path}: {e}")
+        if verbose:
+            print(f"Error extracting text from {djvu_path}: {e}")
         return ""
     except FileNotFoundError:
-        print("djvutxt command not found. Please install DjVuLibre package.")
+        if verbose:
+            print("djvutxt command not found. Please install DjVuLibre package.")
         return ""
 
-def extract_text_from_azw(azw_path):
+def extract_text_from_azw(azw_path, verbose=False):
+    if verbose:
+        print(f"Extracting text from AZW: {azw_path}")
     text = ""
     
     # First attempt: Use textract
+    if verbose:
+        print("Attempting to use textract for AZW extraction...")
     try:
         text = textract.process(azw_path).decode('utf-8')
         if text.strip():
+            if verbose:
+                print(f"Successfully extracted text using textract ({len(text)} characters)")
             return text[:2000]
     except Exception as e:
         if verbose:
@@ -126,6 +159,8 @@ def extract_text_from_azw(azw_path):
                     if len(text) > 3000:
                         break
             if text.strip():
+                if verbose:
+                    print(f"Successfully extracted text using EbookLib ({len(text)} characters)")
                 return text[:2000]
         except Exception as e:
             if verbose:
@@ -140,13 +175,15 @@ def extract_text_from_azw(azw_path):
             with open(filepath, 'r', encoding='utf-8') as f:
                 text = f.read()
             shutil.rmtree(tempdir)
+            if verbose:
+                print(f"Successfully extracted text using mobi library ({len(text)} characters)")
         except Exception as e:
             if verbose:
                 print(f"Error extracting text from {azw_path} using mobi library: {e}")
     
     return text[:2000]
 
-def extract_text_from_pdf(pdf_path, timeout=5):
+def extract_text_from_pdf(pdf_path, timeout=5, verbose=False):
     text = ""
     def target():
         nonlocal text
@@ -155,7 +192,7 @@ def extract_text_from_pdf(pdf_path, timeout=5):
                 reader = PdfReader(file)
                 for page_num in range(min(5, len(reader.pages))):
                     if verbose:
-                        print("reading page: ", page_num, "\n")
+                        print(f"Reading page: {page_num}")
                     page = reader.pages[page_num]
                     extracted_text = page.extract_text() or ''
                     if extracted_text:
@@ -163,29 +200,39 @@ def extract_text_from_pdf(pdf_path, timeout=5):
                     if len(text) > 3000:
                         break
         except (PdfReadError, ValueError, TypeError) as e:
-            print(f"Error extracting text from {pdf_path} with PyPDF2: {e}.")
+            if verbose:
+                print(f"Error extracting text from {pdf_path} with PyPDF2: {e}.")
             text = ""
 
     thread = threading.Thread(target=target)
     thread.start()
     thread.join(timeout)
     if thread.is_alive():
-        print(f"Timeout extracting text from {pdf_path} with PyPDF2. Attempting OCR.")
+        if verbose:
+            print(f"Timeout extracting text from {pdf_path} with PyPDF2. Attempting OCR.")
         terminate_thread(thread)  # Ensure thread is terminated properly
         text = ""
-        print("\ncleaned.\n")
+        if verbose:
+            print("Thread terminated.")
 
     return text[:2000]
 
-def extract_text_with_textract(file_path):
+def extract_text_with_textract(file_path, verbose=False):
+    if verbose:
+        print(f"Extracting text with textract: {file_path}")
     try:
         text = textract.process(file_path).decode('utf-8')
+        if verbose:
+            print(f"Successfully extracted {len(text)} characters with textract")
         return text[:2000]
     except Exception as e:
-        print(f"Error extracting text from {file_path} with textract: {e}")
+        if verbose:
+            print(f"Error extracting text from {file_path} with textract: {e}")
         return ""
 
-def extract_text_from_epub(epub_path):
+def extract_text_from_epub(epub_path, verbose=False):
+    if verbose:
+        print(f"Extracting text from EPUB: {epub_path}")
     text = ""
     try:
         book = epub.read_epub(epub_path)
@@ -195,18 +242,23 @@ def extract_text_from_epub(epub_path):
                 text += soup.get_text(separator="\n")
                 if len(text) > 3000:
                     break
+        if verbose:
+            print(f"Successfully extracted {len(text)} characters from EPUB")
     except Exception as e:
-        print(f"Error extracting text from {epub_path} with EbookLib: {e}")
-        print("Attempting to use textract for EPUB extraction...")
+        if verbose:
+            print(f"Error extracting text from {epub_path} with EbookLib: {e}")
+        if verbose:
+            print("Attempting to use textract for EPUB extraction...")
         try:
-            text = extract_text_with_textract(epub_path)
+            text = extract_text_with_textract(epub_path, verbose=verbose)
         except Exception as inner_e:
-            print(f"Error extracting text from {epub_path} using textract: {inner_e}")
+            if verbose:
+                print(f"Error extracting text from {epub_path} using textract: {inner_e}")
     return text[:2000]
 
-def perform_ocr(pdf_path):
+def perform_ocr(pdf_path, verbose=False):
     if verbose:
-       print("performing OCR...\n")
+       print(f"Performing OCR on: {pdf_path}")
     text = ""
     try:
         pages = convert_from_path(pdf_path, 300, first_page=1, last_page=5)
@@ -214,8 +266,11 @@ def perform_ocr(pdf_path):
             text += pytesseract.image_to_string(page)
             if len(text) > 2000:
                 break
+        if verbose:
+            print(f"Successfully extracted {len(text)} characters through OCR")
     except Exception as e:
-        print(f"Error performing OCR on {pdf_path}: {e}")
+        if verbose:
+            print(f"Error performing OCR on {pdf_path}: {e}")
     return text[:2000]
 
 def clean_author_name(author_name):
@@ -295,7 +350,7 @@ def sort_author_names(author_names, attempt=1, verbose=False):
 
 def send_to_ollama_server(text, filename, attempt=1, verbose=False):
     if verbose:
-       print("consulting ollama server on file:", filename, "in attempt:", attempt, "\n")
+       print(f"Consulting Ollama server on file: {filename} (Attempt: {attempt})")
 
     client = OpenAI(
         base_url="http://localhost:11434/v1/",
@@ -304,15 +359,22 @@ def send_to_ollama_server(text, filename, attempt=1, verbose=False):
     base_filename = os.path.splitext(os.path.basename(filename))[0]
     prompt = (f"Extract the first author name (ignore other authors), year of publication, and title from the following text, considering the filename '{base_filename}' which may contain clues. "
               "I need the output in the following format: \n"
-              "<TITLE>The publication title</TITLE> \n<YEAR>2023</YEAR> \n <AUTHOR>Lastname Surname</AUTHOR> \n\n"
+              "<TITLE>The publication title</TITLE> \n<YEAR>2023</YEAR> \n<AUTHOR>Lastname Surname</AUTHOR> \n\n"
               "Here is the extracted text:\n" + text)
     messages = [{"role": "user", "content": prompt}]
+    
+    if verbose:
+        print(f"Sending prompt to Ollama server: {prompt}")
+
     response = client.chat.completions.create(
         model = modelname,
         temperature=0.7,
         max_tokens=250,
         messages=messages
     )
+
+    if verbose:
+        print(f"Raw content received from server: (start){response.choices[0].message.content}(end)")
 
     output = response.choices[0].message.content.strip()
     if verbose:
@@ -325,27 +387,31 @@ def send_to_ollama_server(text, filename, attempt=1, verbose=False):
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).replace('/', '')
 
-def parse_metadata(content):
-    global verbose
+def parse_metadata(content, verbose=False):
+
     title_match = re.search(r'<TITLE>(.*?)</TITLE>', content)
     year_match = re.search(r'<YEAR>(.*?)</YEAR>', content)
     author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content)
 
     if verbose:
-       print("parsing metadata:", content, "\n")
+       print(f"Parsing metadata: {content}")
+
+    # If TITLE tag is incomplete, try to match it differently
+    if not title_match:
+        title_match = re.search(r'TITLE>(.*?)</TITLE>', content)
 
     if not title_match:
         if verbose:
-            print(f"\nNo match for title in {content}.\n")
+            print(f"\nNo match for title in {content}.")
         return None
 
     if not author_match:
         if verbose:
-            print(f"\nNo match for author in {content}.\n")
+            print(f"\nNo match for author in {content}.")
         return None
 
     if not year_match:
-        print(f"\nNo match for year in {content}. Continuing without year.\n")
+        print(f"\nNo match for year in {content}. Continuing without year.")
 
     title = sanitize_filename(title_match.group(1).strip())
     year = sanitize_filename(year_match.group(1).strip() if year_match else "")
@@ -356,14 +422,14 @@ def parse_metadata(content):
 
     if any(placeholder in (title.lower(), author.lower()) for placeholder in ["unknown", "n a", ""]) or year.lower() == "unknown" or year == "n a":
         if verbose:
-            print("Error: found 'unknown' or 'n a' or '' in title, year or author!\n")
+            print("Error: found 'unknown' or 'n a' or '' in title, year or author!")
         return None
 
     return {'author': author, 'year': year, 'title': title}
 
-def process_file(file_path, attempt=1):
+def process_file(file_path, attempt=1, verbose=False):
     if verbose:
-        print("processing file:", file_path, " in attempt:", attempt, "\n")
+        print(f"Processing file: {file_path} (Attempt: {attempt})")
 
     if attempt > 4:
         if verbose:
@@ -372,69 +438,67 @@ def process_file(file_path, attempt=1):
 
     try:
         if file_path.lower().endswith('.pdf'):
-            text = extract_text_from_pdf(file_path)
+            text = extract_text_from_pdf(file_path, verbose=verbose)
         elif file_path.lower().endswith('.epub'):
-            text = extract_text_from_epub(file_path)
+            text = extract_text_from_epub(file_path, verbose=verbose)
         elif file_path.lower().endswith('.docx'):
-            text = extract_text_from_docx(file_path)
+            text = extract_text_from_docx(file_path, verbose=verbose)
         elif file_path.lower().endswith(('.azw', '.azw3')):
-            text = extract_text_from_azw(file_path)
+            text = extract_text_from_azw(file_path, verbose=verbose)
         elif file_path.lower().endswith('.djvu'):
-            text = extract_text_from_djvu(file_path)
+            text = extract_text_from_djvu(file_path, verbose=verbose)
         elif file_path.lower().endswith(('.doc', '.xls', '.xlsx', '.ppt', '.pptx', 
                                          '.odt', '.ods', '.odp', '.jpg', '.jpeg', '.png', 
                                          '.gif', '.html', '.xml', '.rtf', '.md', '.txt')):
-            text = extract_text_with_textract(file_path)
+            text = extract_text_with_textract(file_path, verbose=verbose)
         elif file_path.lower().endswith('.mobi'):
-            text = extract_text_from_mobi(file_path)
+            text = extract_text_from_mobi(file_path, verbose=verbose)
         else:
             if verbose:
                 print(f"Unsupported file format for {file_path}.")
             return None
 
         if verbose:
-           print("returned from extraction.\n")
+           print(f"Extracted text: {text[:100]}...")  # Print first 100 characters
+
     except Exception as e:
         if verbose:
             print(f"Error extracting text from {file_path}: {e}. Attempting OCR next.")
         text = ""
 
-    if verbose:
-       print("extracted text: ", text, ".\n")
-
     if not text.strip():
         if file_path.lower().endswith(('.pdf', '.djvu')):
             try:
                 if verbose:
-                    print("attempting ocr next...\n")
-                text = perform_ocr(file_path)
+                    print("Attempting OCR...")
+                text = perform_ocr(file_path, verbose=verbose)
             except Exception as e:
                 if verbose:
                     print(f"Error extracting text from {file_path} with OCR: {e}")
                 return None
 
     try:
-        metadata_content = send_to_ollama_server(text, file_path, attempt)
+        metadata_content = send_to_ollama_server(text, file_path, attempt, verbose=verbose)
     except Exception as e:
         if verbose:
             print(f"Error sending text to server for {file_path}: {e}")
         return None
 
-    metadata = parse_metadata(metadata_content)
+    metadata = parse_metadata(metadata_content, verbose=verbose)
     if metadata:
-        corrected_authors = sort_author_names(metadata['author'])
+        corrected_authors = sort_author_names(metadata['author'], verbose=verbose)
         if verbose:
             print(f"Corrected author: '{corrected_authors}'")
         metadata['author'] = corrected_authors
         if not valid_author_name(metadata['author']):
             if verbose:
                 print(f"Author's name still invalid after sorting, retrying for {file_path}. Attempt {attempt}")
-            return process_file(file_path, attempt + 1)
+            return process_file(file_path, attempt + 1, verbose=verbose)
         return metadata
     else:
         if verbose:
             print(f"Error: Metadata parsing failed or incomplete for {file_path}. \nMetadata content: {metadata_content}, retrying... Attempt {attempt}")
-        return process_file(file_path, attempt + 1)
+        return process_file(file_path, attempt + 1, verbose=verbose)
 
 def execute_rename_commands(script_path):
     try:
@@ -461,10 +525,12 @@ def main(directory, verbose, force):
         mv_file.write("#!/bin/bash\n")
         mv_file.flush()
 
-    for filename in tqdm(files):
+    for filename in tqdm(files, disable=not verbose):
         file_path = os.path.join(directory, filename)
         try:
-            metadata = process_file(file_path)
+            if verbose:
+                print(f"\nProcessing: {file_path}")
+            metadata = process_file(file_path, verbose=verbose)
             if metadata:
                 first_author = sanitize_filename(metadata['author'].split(", ")[0])
                 target_dir = os.path.join(directory, first_author)
@@ -474,10 +540,14 @@ def main(directory, verbose, force):
                     mv_file.write(f"mkdir -p \"{target_dir}\"\n")
                     mv_file.write(f"mv \"{file_path}\" \"{new_file_path}\"\n")
                     mv_file.flush()
+                if verbose:
+                    print(f"Rename command added for: {file_path}")
             else:
                 with open("unparseables.lst", "a") as unparseable_file:
                     unparseable_file.write(f"{file_path}\n")
                     unparseable_file.flush()
+                if verbose:
+                    print(f"Added to unparseables: {file_path}")
         except Exception as e:
             print(f"Failed to process {file_path}: {e}")
             with open("unparseables.lst", "a") as unparseable_file:

@@ -61,7 +61,7 @@ chmod +x ./rename_commands.sh
 - The script retries metadata extraction multiple times to ensure accuracy, especially for author names.
 - Files that cannot be parsed are listed in "unparseables.lst".
 - Customize the script's model or configurations as necessary to fit your specific needs.
-- For some filetapes, the script uses multiple methods (mobi library, ebooklib, and textract) to attempt text extraction.
+- For some filetypes, the script uses multiple methods (like mobi library, ebooklib, and textract) to attempt text extraction.
 
 ## Limitations
 

@@ -1,4 +1,4 @@
-    #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Cross-platform PDF and EPUB text extraction tool
 

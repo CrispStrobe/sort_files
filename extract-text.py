@@ -45,20 +45,7 @@ from pathlib import Path
 from importlib.metadata import version, PackageNotFoundError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-
-
-@contextmanager
-def _progress_context(self, message: str):
-    """Context manager for progress reporting"""
-    progress = tqdm(
-        desc=message,
-        unit='pages',
-        disable=False  # Changed from self._debug to False to always show progress
-    )
-    try:
-        yield progress
-    finally:
-        progress.close()
+import signal
 
 class timeout:
     """Context manager for timeout"""
@@ -152,21 +139,8 @@ class ExtractionManager:
     def _setup_logging(self, debug: bool):
         """Configure logging with appropriate level and handlers"""
         level = logging.DEBUG if debug else logging.INFO
-        format_str = '%(levelname)s: %(message)s' if debug else '%(message)s'
-        
-        # Clear any existing handlers
-        logging.getLogger().handlers = []
-        
-        # Configure logging
-        logging.basicConfig(
-            level=level,
-            format=format_str,
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('extraction.log', encoding='utf-8')
-            ]
-        )
-        
+        logging.getLogger().setLevel(level)
+
         # Suppress common warnings
         warnings.filterwarnings('ignore', category=DeprecationWarning)
         warnings.filterwarnings('ignore', category=UserWarning)
@@ -665,9 +639,10 @@ class TableExtractor:
         return tables
         
     def _init_camelot(self) -> bool:
-        """Initialize Camelot library"""
+        """Initialize Camelot library only when needed."""
         if self._camelot is None:
             try:
+                # Lazy import for Camelot (which may in turn import pydot)
                 self._camelot = self._import_cache.import_module('camelot')
                 return True
             except Exception as e:
@@ -675,52 +650,6 @@ class TableExtractor:
                 return False
         return True
 
-class ImportCache:
-    """Global cache for imports and their availability"""
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._modules = {}
-            cls._instance._available = {}
-        return cls._instance
-    
-    def is_available(self, module_name: str, submodules: List[str] = None) -> bool:
-        """Check if module and optional submodules can be imported"""
-        cache_key = f"{module_name}:{','.join(submodules or [])}"
-        if cache_key not in self._available:
-            try:
-                import importlib.util
-                # Check main module
-                if importlib.util.find_spec(module_name) is None:
-                    self._available[cache_key] = False
-                    return False
-                # Check submodules if specified
-                if submodules:
-                    for submodule in submodules:
-                        full_name = f"{module_name}.{submodule}"
-                        if importlib.util.find_spec(full_name) is None:
-                            self._available[cache_key] = False
-                            return False
-                self._available[cache_key] = True
-            except Exception:
-                self._available[cache_key] = False
-        return self._available[cache_key]
-
-    def import_module(self, module_name: str, submodule: str = None) -> Any:
-        """Import and cache a module"""
-        cache_key = f"{module_name}{f'.{submodule}' if submodule else ''}"
-        if cache_key not in self._modules:
-            try:
-                if submodule:
-                    main_module = __import__(module_name, fromlist=[submodule])
-                    self._modules[cache_key] = getattr(main_module, submodule)
-                else:
-                    self._modules[cache_key] = __import__(module_name)
-            except ImportError as e:
-                raise ImportError(f"Failed to import {cache_key}: {e}")
-        return self._modules[cache_key]
     
 class PDFExtractor:
     """Enhanced PDF text extraction with lazy loading and multiple fallback methods"""
@@ -765,6 +694,7 @@ class PDFExtractor:
         self._password = None
         self._current_doc = None
         self._ocr_initialized = {}
+        self._available_methods = None
         
         # Setup Windows paths
         self._setup_windows_paths()
@@ -1516,6 +1446,8 @@ class PDFExtractor:
     def _preprocess_image(self, image) -> 'PIL.Image':
         """Optimize image for OCR"""
         try:
+            PIL = self._import_cache.import_module('PIL')
+
             # Convert to grayscale
             if image.mode != 'L':
                 image = image.convert('L')
@@ -1765,6 +1697,8 @@ class DocumentProcessor:
     def __init__(self, debug: bool = False):
         self.manager = ExtractionManager(debug=debug)
         self._debug = debug
+        # (Optional) Initialize table extractor once if needed
+        self._table_extractor = TableExtractor(ImportCache())
         
     def process_files(self, input_files: List[str], 
                  output_dir: Optional[str] = None,
@@ -1833,6 +1767,35 @@ class DocumentProcessor:
             'results': results,
             'failed': failed
         }
+    
+    def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Extract PDF metadata using PyPDF"""
+        metadata = {}
+        try:
+            from pypdf import PdfReader
+            with open(file_path, "rb") as f:
+                reader = PdfReader(f)
+                doc_info = reader.metadata
+                if doc_info:
+                    for key, value in doc_info.items():
+                        metadata[key] = value
+        except Exception as e:
+            logging.warning(f"Failed to extract PDF metadata: {e}")
+        return metadata
+
+    def _extract_epub_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Extract EPUB metadata using ebooklib"""
+        metadata = {}
+        try:
+            from ebooklib import epub
+            book = epub.read_epub(file_path)
+            titles = book.get_metadata('DC', 'title')
+            creators = book.get_metadata('DC', 'creator')
+            metadata['title'] = titles[0][0] if titles else None
+            metadata['authors'] = [item[0] for item in creators] if creators else None
+        except Exception as e:
+            logging.warning(f"Failed to extract EPUB metadata: {e}")
+        return metadata
     
     def _get_unique_output_path(self, input_file: str, output_dir: Optional[str] = None) -> str:
         """Generate unique output path with counter if file exists"""
@@ -1913,6 +1876,21 @@ class DocumentProcessor:
                     logging.error(f"Failed to write output file {output_path}: {e}")
                     result['success'] = False
                     result['error'] = str(e)
+                
+                # (Integration for Table Extraction)
+                if extract_tables and input_file.lower().endswith('.pdf'):
+                    try:
+                        tables = self._table_extractor.extract_tables(input_file)
+                        # Convert each table (assuming each table has a .df attribute, e.g., a pandas DataFrame)
+                        result['tables'] = [table.df.to_dict() for table in tables]
+                        if self._debug:
+                            logging.info(f"Extracted {len(tables)} tables from {input_file}")
+                    except Exception as te:
+                        logging.error(f"Table extraction failed for {input_file}: {te}")
+                        result['tables'] = []
+                    
+                # (Integration for Metadata Extraction)
+                result['metadata'] = self._extract_metadata(input_file)
                     
         except Exception as e:
             error_msg = f"Processing failed: {str(e)}"
@@ -1977,6 +1955,12 @@ def main():
         '-m', '--method',
         help="Preferred extraction method"
     )
+
+    parser.add_argument(
+        '-r', '--recursive',
+        action='store_true',
+        help="Process files recursively through subdirectories"
+    )
     
     parser.add_argument(
         '-p', '--password',
@@ -2017,12 +2001,28 @@ def main():
     try:
         # Expand file patterns
         input_files = []
-        for pattern in args.files:
-            matched_files = glob.glob(pattern)
-            if matched_files:
-                input_files.extend(matched_files)
-            else:
-                logging.warning(f"No files found matching pattern: {pattern}")
+        if args.recursive:
+            for pattern in args.files:
+                # If the pattern is an existing directory, walk it recursively.
+                if os.path.isdir(pattern):
+                    for root, _, files in os.walk(pattern):
+                        for file in files:
+                            if file.lower().endswith(('.pdf', '.epub')):
+                                input_files.append(os.path.join(root, file))
+                else:
+                    # If pattern is a file pattern (e.g. "*.pdf"), use glob with recursive=True.
+                    matched_files = glob.glob(pattern, recursive=True)
+                    if matched_files:
+                        input_files.extend(matched_files)
+                    else:
+                        logging.warning(f"No files found matching pattern: {pattern}")
+        else:
+            for pattern in args.files:
+                matched_files = glob.glob(pattern)
+                if matched_files:
+                    input_files.extend(matched_files)
+                else:
+                    logging.warning(f"No files found matching pattern: {pattern}")
         
         if not input_files:
             logging.error("No input files found")

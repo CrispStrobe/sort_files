@@ -1701,15 +1701,17 @@ class DocumentProcessor:
         self._table_extractor = TableExtractor(ImportCache())
         
     def process_files(self, input_files: List[str], 
-                 output_dir: Optional[str] = None,
-                 method: Optional[str] = None,
-                 password: Optional[str] = None,
-                 extract_tables: bool = False,
-                 max_workers: int = None,
-                 **kwargs) -> Dict[str, Any]:
+                output_dir: Optional[str] = None,
+                method: Optional[str] = None,
+                password: Optional[str] = None,
+                extract_tables: bool = False,
+                max_workers: int = None,
+                noskip: bool = False,
+                **kwargs) -> Dict[str, Any]:
         """Process multiple files with interrupt handling"""
         results = {}
         failed = []
+        skipped = []
         
         # Ensure output directory exists
         if output_dir:
@@ -1730,6 +1732,7 @@ class DocumentProcessor:
                         method,
                         password,
                         extract_tables,
+                        noskip,
                         **kwargs
                     )
                     futures[future] = input_file
@@ -1739,7 +1742,9 @@ class DocumentProcessor:
                     try:
                         result = future.result()
                         results[input_file] = result
-                        if not result['success']:
+                        if result.get('skipped', False):
+                            skipped.append(input_file)
+                        elif not result['success']:
                             failed.append((input_file, result.get('error', 'Unknown error')))
                             if self._debug:
                                 logging.error(f"Failed to process {input_file}: {result.get('error')}")
@@ -1756,7 +1761,13 @@ class DocumentProcessor:
             logging.info(f"\nProcessing Summary:")
             logging.info(f"Total files: {len(input_files)}")
             logging.info(f"Successful: {successful}")
+            logging.info(f"Skipped: {len(skipped)}")
             logging.info(f"Failed: {len(failed)}")
+            
+            if skipped:
+                logging.info("\nSkipped files (output already exists):")
+                for file in skipped:
+                    logging.info(f"  {file}")
             
             if failed:
                 logging.info("\nFailed files:")
@@ -1765,7 +1776,8 @@ class DocumentProcessor:
         
         return {
             'results': results,
-            'failed': failed
+            'failed': failed,
+            'skipped': skipped
         }
     
     def _extract_pdf_metadata(self, file_path: str) -> Dict[str, Any]:
@@ -1829,12 +1841,13 @@ class DocumentProcessor:
             counter += 1
 
     def _process_single_file(self, input_file: str,
-                            output_dir: Optional[str] = None,
-                            method: Optional[str] = None,
-                            password: Optional[str] = None,
-                            extract_tables: bool = False,
-                            **kwargs) -> Dict[str, Any]:
-        """Process a single document"""
+                        output_dir: Optional[str] = None,
+                        method: Optional[str] = None,
+                        password: Optional[str] = None,
+                        extract_tables: bool = False,
+                        noskip: bool = False,
+                        **kwargs) -> Dict[str, Any]:
+        """Process a single document, skipping if output already exists unless noskip=True"""
         result = {
             'success': False,
             'text': '',
@@ -1846,6 +1859,15 @@ class DocumentProcessor:
         try:
             # Generate unique output path
             output_path = self._get_unique_output_path(input_file, output_dir)
+            
+            # Skip processing if output file already exists and noskip is False
+            if not noskip and Path(output_path).exists():
+                if self._debug:
+                    logging.info(f"Skipping {input_file} - output file {output_path} already exists")
+                result['success'] = True
+                result['output_path'] = output_path
+                result['skipped'] = True
+                return result
             
             if self._debug:
                 logging.info(f"Processing {input_file} -> {output_path}")
@@ -1936,6 +1958,7 @@ def main():
               %(prog)s -o output_dir/ *.pdf
               %(prog)s -m pymupdf -p password input.pdf
               %(prog)s -t -j output.json *.pdf
+              %(prog)s --noskip input.pdf  # Process even if output exists
         """)
     )
     
@@ -1990,6 +2013,12 @@ def main():
         help="Enable debug logging"
     )
     
+    parser.add_argument(
+        '--noskip',
+        action='store_true',
+        help="Process files even if output text file already exists"
+    )
+    
     args = parser.parse_args()
     
     # Configure logging
@@ -2038,7 +2067,8 @@ def main():
                 method=args.method,
                 password=args.password,
                 extract_tables=args.tables,
-                max_workers=args.workers
+                max_workers=args.workers,
+                noskip=args.noskip
             )
             
             # Handle results
@@ -2046,6 +2076,13 @@ def main():
                 import json
                 with open(args.json, 'w', encoding='utf-8') as f:
                     json.dump(results, f, indent=2, ensure_ascii=False)
+            
+            # Update return code logic to include skipped files in the summary
+            successful = len(results.get('results', {})) - len(results.get('failed', []))
+            skipped = len(results.get('skipped', []))
+            
+            if args.debug:
+                logging.info(f"Summary: {successful} succeeded, {skipped} skipped, {len(results.get('failed', []))} failed")
             
             return 0 if not results.get('failed') else 1
             

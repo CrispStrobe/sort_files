@@ -92,10 +92,12 @@ class ImportCache:
     
     def is_available(self, module_name: str, submodules: List[str] = None) -> bool:
         """Check if module and optional submodules can be imported"""
+        # Import importlib here to ensure it's available
+        import importlib.util
+        
         cache_key = f"{module_name}:{','.join(submodules or [])}"
         if cache_key not in self._available:
             try:
-                import importlib.util
                 # Check main module
                 if importlib.util.find_spec(module_name) is None:
                     self._available[cache_key] = False
@@ -114,14 +116,17 @@ class ImportCache:
 
     def import_module(self, module_name: str, submodule: str = None) -> Any:
         """Import and cache a module"""
+        # Import importlib here to ensure it's available
+        import importlib
+        
         cache_key = f"{module_name}{f'.{submodule}' if submodule else ''}"
         if cache_key not in self._modules:
             try:
                 if submodule:
-                    main_module = __import__(module_name, fromlist=[submodule])
+                    main_module = importlib.import_module(module_name)
                     self._modules[cache_key] = getattr(main_module, submodule)
                 else:
-                    self._modules[cache_key] = __import__(module_name)
+                    self._modules[cache_key] = importlib.import_module(module_name)
             except ImportError as e:
                 raise ImportError(f"Failed to import {cache_key}: {e}")
         return self._modules[cache_key]
@@ -144,6 +149,24 @@ class ExtractionManager:
         # Suppress common warnings
         warnings.filterwarnings('ignore', category=DeprecationWarning)
         warnings.filterwarnings('ignore', category=UserWarning)
+        
+        # Suppress detailed logs from specific libraries
+        logging.getLogger('PIL').setLevel(logging.WARNING)
+        logging.getLogger('pdf2image').setLevel(logging.WARNING)
+        logging.getLogger('pytesseract').setLevel(logging.WARNING)
+        logging.getLogger('pdfminer').setLevel(logging.WARNING)
+        logging.getLogger('pypdf').setLevel(logging.WARNING)
+        logging.getLogger('camelot').setLevel(logging.WARNING)
+        logging.getLogger('pymupdf').setLevel(logging.WARNING)
+        
+        # Additional debug logging suppression for PyPDF
+        if not debug:
+            logging.getLogger('pypdf').setLevel(logging.ERROR)
+        else:
+            # Even in debug mode, limit some excessive loggers
+            logging.getLogger('pypdf.filters').setLevel(logging.INFO)
+            logging.getLogger('pypdf.xref').setLevel(logging.INFO)
+            logging.getLogger('pypdf.generic').setLevel(logging.INFO)
 
     def _check_binaries(self) -> Dict[str, bool]:
         """Check availability of system binaries"""
@@ -705,7 +728,24 @@ class PDFExtractor:
     def _safe_import(self, module_name):
         """Safely import a module with error handling"""
         try:
-            return importlib.import_module(module_name)
+            # Use importlib directly instead of relying on a global import
+            import importlib
+            
+            # Split module_name to handle submodules (e.g., 'PIL.Image')
+            parts = module_name.split('.')
+            if len(parts) > 1:
+                # For submodules, import the base and then get the attribute
+                base_module = importlib.import_module(parts[0])
+                current = base_module
+                
+                # Navigate through the module hierarchy
+                for part in parts[1:]:
+                    current = getattr(current, part)
+                
+                return current
+            else:
+                # Direct import for simple module names
+                return importlib.import_module(module_name)
         except ImportError as e:
             if self._debug:
                 logging.debug(f"Cannot import {module_name}: {e}")
@@ -729,6 +769,7 @@ class PDFExtractor:
         self._current_doc = None
         self._ocr_initialized = {}
         self._available_methods = None
+        self._ocr_failed_methods = set()
         
         # Setup Windows paths first
         self._setup_windows_paths()
@@ -898,8 +939,8 @@ class PDFExtractor:
                         return False
                     
                     # Import required packages
-                    pytesseract = self._safe_import('pytesseract')
-                    pdf2image = self._safe_import('pdf2image')
+                    import pytesseract
+                    import pdf2image
                     
                     if pytesseract and pdf2image:
                         try:
@@ -987,8 +1028,8 @@ class PDFExtractor:
         # Start with reliable methods only
         methods = ['pymupdf', 'pdfplumber', 'pypdf']  # Fast and reliable methods
         
-        # Skip problematic OCR methods
-        ocr_methods = ['tesseract']  # Only include tesseract for OCR
+        # You might want to skip problematic OCR methods
+        ocr_methods = ['tesseract', 'doctr', 'easyocr', 'kraken']
         text_parts = []
         current_method = None
 
@@ -1012,12 +1053,18 @@ class PDFExtractor:
                     
                     if progress_callback:
                         progress_callback(0, method)
-                        
+                    
                     extraction_func = getattr(self, f'extract_with_{method}')
-                    text = extraction_func(
-                        pdf_path,
-                        lambda n: progress_callback(n, method) if progress_callback else None
-                    )
+                    
+                    # Check for keyboard interrupt more frequently
+                    try:
+                        text = extraction_func(
+                            pdf_path,
+                            lambda n: progress_callback(n, method) if progress_callback else None
+                        )
+                    except KeyboardInterrupt:
+                        print("\nExtraction interrupted by user.")
+                        raise
                     
                     if text and text.strip():
                         text_parts.append(text.strip())
@@ -1029,6 +1076,8 @@ class PDFExtractor:
                                 logging.info(f"Got good quality text from {method}, stopping here")
                             break
                     
+                except KeyboardInterrupt:
+                    raise
                 except Exception as e:
                     if self._debug:
                         logging.error(f"Error with {method}: {e}")
@@ -1054,21 +1103,37 @@ class PDFExtractor:
                         if progress_callback:
                             progress_callback(0, method)
                             
+                        # Use _init_ocr to check/initialize OCR method
+                        if not self._init_ocr(method):
+                            if self._debug:
+                                logging.debug(f"Skipping {method} - initialization failed")
+                            continue
+                            
                         extraction_func = getattr(self, f'extract_with_{method}')
-                        text = extraction_func(
-                            pdf_path,
-                            lambda n: progress_callback(n, method) if progress_callback else None
-                        )
                         
+                        # Check for keyboard interrupt more frequently
+                        try:
+                            text = extraction_func(
+                                pdf_path,
+                                lambda n: progress_callback(n, method) if progress_callback else None
+                            )
+                        except KeyboardInterrupt:
+                            print("\nOCR processing interrupted by user.")
+                            raise
+                            
                         if text and text.strip():
                             text_parts.append(text.strip())
                             if self._debug:
                                 logging.info(f"Got text from {method}")
                             break  # One successful OCR method is enough
                             
+                    except KeyboardInterrupt:
+                        logging.info("Extraction process interrupted.")
+                        raise
                     except Exception as e:
                         if self._debug:
                             logging.error(f"Error with {method}: {e}")
+                        self._ocr_failed_methods.add(method)  # Remember this method failed
                         continue
                     finally:
                         if progress_callback and current_method == method:
@@ -1351,6 +1416,10 @@ class PDFExtractor:
     def extract_with_pypdf(self, pdf_path: str, progress_callback=None) -> str:
         """Extract text using pypdf with encryption support and progress bar"""
         pypdf = self._import_cache.import_module('pypdf')
+        
+        # Disable debug logging from pypdf
+        logging.getLogger('pypdf').setLevel(logging.WARNING)
+        
         text_parts = []
         
         try:
@@ -1454,15 +1523,20 @@ class PDFExtractor:
                             return False
                         
                         # Import dependencies
-                        pytesseract = self._safe_import('pytesseract')
-                        pdf2image = self._safe_import('pdf2image')
-                        PIL = self._safe_import('PIL.Image')
+                        import pytesseract
+                        import pdf2image
+                        import PIL.Image  # import as module, not as name
                         
-                        if not (pytesseract and pdf2image and PIL):
+                        if not (pytesseract and pdf2image and PIL.Image):
                             if self._debug:
                                 logging.debug("Missing dependencies for Tesseract OCR")
                             self._ocr_initialized[method] = False
                             return False
+                        
+                        # Store the imported modules for later use
+                        self._pytesseract = pytesseract
+                        self._pdf2image = pdf2image
+                        self._PIL = PIL
                         
                         # Verify Tesseract installation
                         try:
@@ -1483,6 +1557,9 @@ class PDFExtractor:
                 elif method == 'kraken':
                     # Check if we should attempt kraken at all
                     try:
+                        # Disable excessive debug logging from kraken
+                        logging.getLogger('kraken').setLevel(logging.WARNING)
+                        
                         # Use safer try/except import rather than direct import
                         kraken_lib = self._safe_import('kraken.lib')
                         kraken_binarization = self._safe_import('kraken.binarization')
@@ -1671,16 +1748,17 @@ class PDFExtractor:
         if not self._init_ocr('tesseract'):
             return ""
             
-        pytesseract = self._import_cache.import_module('pytesseract')
-        pdf2image = self._import_cache.import_module('pdf2image')
-        PIL = self._import_cache.import_module('PIL')
+        # Use the stored module references instead of importing again
+        pytesseract = self._pytesseract
+        pdf2image = self._pdf2image
+        PIL = self._PIL
         
         text_parts = []
         images = None
         
         try:
             # Convert PDF to images with progress bar
-            with tqdm(desc="Converting PDF to images", unit="page") as pbar:
+            with tqdm(desc="Converting PDF to images for tesseract", unit="page") as pbar:
                 images = pdf2image.convert_from_path(
                     pdf_path,
                     dpi=300,
@@ -1691,7 +1769,7 @@ class PDFExtractor:
                 pbar.update(len(images))
             
             # Process images with OCR
-            with tqdm(total=len(images), desc="OCR Processing", unit="page") as pbar:
+            with tqdm(total=len(images), desc="OCR Processing with tesseract", unit="page") as pbar:
                 for i, image in enumerate(images, 1):
                     try:
                         # Preprocess image
@@ -1826,7 +1904,7 @@ class PDFExtractor:
         doctr = self._import_cache.import_module('doctr')
         
         try:
-            with tqdm(desc="Loading document", unit="file") as pbar:
+            with tqdm(desc="Loading document for doctr", unit="file") as pbar:
                 doc = doctr.io.DocumentFile.from_pdf(pdf_path)
                 pbar.update(1)
             
@@ -1909,7 +1987,7 @@ class PDFExtractor:
         
         try:
             # Convert PDF to images with progress
-            with tqdm(desc="Converting PDF to images", unit="page") as pbar:
+            with tqdm(desc="Converting PDF to images for kraken", unit="page") as pbar:
                 images = pdf2image.convert_from_path(
                     pdf_path,
                     dpi=300,
@@ -2040,8 +2118,8 @@ class DocumentProcessor:
                     finally:
                         pbar.update(1)
         
-        # Print summary if in debug mode
-        if self._debug:
+        # Print summary 
+        if True: # or change to: self._debug
             successful = len([r for r in results.values() if r['success']])
             logging.info(f"\nProcessing Summary:")
             logging.info(f"Total files: {len(input_files)}")
@@ -2049,12 +2127,12 @@ class DocumentProcessor:
             logging.info(f"Skipped: {len(skipped)}")
             logging.info(f"Failed: {len(failed)}")
             
-            if skipped:
+            if skipped: # and self._debug:
                 logging.info("\nSkipped files (output already exists):")
                 for file in skipped:
                     logging.info(f"  {file}")
             
-            if failed:
+            if failed: # and self._debug:
                 logging.info("\nFailed files:")
                 for file, error in failed:
                     logging.info(f"  {file}: {error}")
@@ -2094,8 +2172,18 @@ class DocumentProcessor:
             logging.warning(f"Failed to extract EPUB metadata: {e}")
         return metadata
     
-    def _get_unique_output_path(self, input_file: str, output_dir: Optional[str] = None) -> str:
-        """Generate unique output path with counter if file exists"""
+    def _get_unique_output_path(self, input_file: str, output_dir: Optional[str] = None, noskip: bool = False) -> str:
+        """
+        Generate output path for a given input file
+        
+        Args:
+            input_file: Path to input file
+            output_dir: Optional output directory
+            noskip: Whether to generate unique filenames for existing files
+            
+        Returns:
+            Output path (without creating unique name if noskip=False)
+        """
         # Convert input file to absolute path
         input_path = Path(input_file).resolve()
         
@@ -2108,22 +2196,25 @@ class DocumentProcessor:
         # Get base name without extension
         base_name = input_path.stem
         
-        # Start with basic output path
-        counter = 0
-        while True:
-            if counter == 0:
-                output_name = f"{base_name}.txt"
-            else:
+        # Create basic output path
+        output_name = f"{base_name}.txt"
+        output_path = output_dir / output_name
+        
+        # If noskip is True, ensure we have a unique filename to avoid overwriting
+        if noskip and output_path.exists():
+            counter = 1
+            while True:
                 output_name = f"{base_name}_{counter}.txt"
+                output_path = output_dir / output_name
                 
-            output_path = output_dir / output_name
-            
-            if not output_path.exists():
-                if self._debug:
-                    logging.debug(f"Using output path: {output_path}")
-                return str(output_path)
-            
-            counter += 1
+                if not output_path.exists():
+                    if self._debug:
+                        logging.debug(f"Using unique output path: {output_path}")
+                    break
+                
+                counter += 1
+        
+        return str(output_path)
 
     def _process_single_file(self, input_file: str,
                         output_dir: Optional[str] = None,
@@ -2138,21 +2229,26 @@ class DocumentProcessor:
             'text': '',
             'tables': [],
             'metadata': {},
-            'input_file': input_file
+            'input_file': input_file,
+            'skipped': False
         }
         
         try:
-            # Generate unique output path
-            output_path = self._get_unique_output_path(input_file, output_dir)
+             # Generate basic output path (no uniqueness yet)
+            basic_output_path = self._get_unique_output_path(input_file, output_dir, noskip=False)
             
-            # Skip processing if output file already exists and noskip is False
-            if not noskip and Path(output_path).exists():
+            # Check if output file already exists and we're not in noskip mode
+            if not noskip and os.path.exists(basic_output_path):
                 if self._debug:
-                    logging.info(f"Skipping {input_file} - output file {output_path} already exists")
+                    logging.info(f"Skipping {input_file} - output file {basic_output_path} already exists")
                 result['success'] = True
-                result['output_path'] = output_path
                 result['skipped'] = True
+                result['output_path'] = basic_output_path
                 return result
+            
+            # If we're here, either the file doesn't exist or noskip=True
+            # Get the actual output path (which might be a unique name if noskip=True)
+            output_path = self._get_unique_output_path(input_file, output_dir, noskip=noskip)
             
             if self._debug:
                 logging.info(f"Processing {input_file} -> {output_path}")
@@ -2346,6 +2442,17 @@ def main():
         processor = DocumentProcessor(debug=args.debug)
         
         try:
+            # Set up robust signal handling
+            def signal_handler(sig, frame):
+                print("\nOperation interrupted by user. Cleaning up...")
+                # Perform any cleanup needed
+                sys.exit(130)
+            
+            # Register signal handlers for common interrupt signals
+            signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+            if platform.system() != 'Windows':
+                signal.signal(signal.SIGTSTP, signal_handler)  # Ctrl
+            
             results = processor.process_files(
                 input_files,
                 output_dir=args.output_dir,

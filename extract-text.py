@@ -196,20 +196,22 @@ class ExtractionManager:
         
         if cache_key not in self._extractors:
             if file_ext == '.pdf':
-                # Changed: Only pass debug parameter once
                 self._extractors[cache_key] = PDFExtractor(debug=self._debug)
             elif file_ext == '.epub':
-                self._extractors[cache_key] = EPUBExtractor(debug=self._debug)
+                # Create and pass the ImportCache instance
+                import_cache = ImportCache()
+                self._extractors[cache_key] = EPUBExtractor(import_cache=import_cache, debug=self._debug)
             else:
                 raise ValueError(f"Unsupported file type: {file_path}")
         
         return self._extractors[cache_key]
     
     def extract(self, input_path: str, 
-            output_path: Optional[str] = None,
-            method: Optional[str] = None,
-            password: Optional[str] = None,
-            **kwargs) -> Union[str, bool]:
+        output_path: Optional[str] = None,
+        method: Optional[str] = None,
+        password: Optional[str] = None,
+        extract_tables: bool = False,  
+        **kwargs) -> Union[str, bool]:
         """
         Extract text from a document with progress reporting and error handling
         
@@ -218,6 +220,7 @@ class ExtractionManager:
             output_path: Optional path for output text file
             method: Preferred extraction method
             password: Password for encrypted documents
+            extract_tables: Whether to extract tables (PDF only)
             **kwargs: Additional extraction options
             
         Returns:
@@ -237,12 +240,17 @@ class ExtractionManager:
                     if engine:
                         pbar.set_description(f"Extracting text [{engine}]")
                     pbar.update(n)
-                    
+                
+                # Only pass extract_tables parameter to PDFExtractor
+                extraction_kwargs = kwargs.copy()
+                if isinstance(extractor, PDFExtractor) and extract_tables:
+                    extraction_kwargs['extract_tables'] = extract_tables
+                
                 text = extractor.extract_text(
                     input_path,
                     preferred_method=method,
                     progress_callback=progress_callback,
-                    **kwargs
+                    **extraction_kwargs
                 )
                 
             # Validate and handle output
@@ -669,17 +677,43 @@ class PDFExtractor:
     def _setup_windows_paths(self):
         """Add binary paths to system PATH for Windows"""
         if platform.system() == 'Windows':
+            # Define paths to check with most specific paths first
             paths_to_check = [
+                # Ghostscript - specific versions
+                r'C:\Program Files\gs\gs10.04.0\bin',
+                r'C:\Program Files\gs\gs10.02.0\bin',
+                r'C:\Program Files (x86)\gs\gs10.04.0\bin',
+                r'C:\Program Files (x86)\gs\gs10.02.0\bin',
+                # Poppler - specific versions
+                r'C:\Users\stc\Downloads\code\poppler-24.08.0\Library\bin',
+                r'C:\Program Files\poppler-24.02.0\Library\bin',
+                # Tesseract
                 r'C:\Program Files\Tesseract-OCR',
                 r'C:\Program Files (x86)\Tesseract-OCR',
-                r'C:\Program Files\gs\gs10.02.0\bin',  # Update version as needed
-                r'C:\Program Files (x86)\gs\gs10.02.0\bin',
-                r'C:\Program Files\poppler-24.02.0\Library\bin',  # Update version as needed
             ]
             
+            # Add each existing path to PATH
+            paths_added = []
             for path in paths_to_check:
                 if os.path.exists(path) and path not in os.environ['PATH']:
                     os.environ['PATH'] = path + os.pathsep + os.environ['PATH']
+                    paths_added.append(path)
+            
+            if paths_added and self._debug:
+                logging.debug(f"Added to PATH: {', '.join(paths_added)}")
+    
+    def _safe_import(self, module_name):
+        """Safely import a module with error handling"""
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as e:
+            if self._debug:
+                logging.debug(f"Cannot import {module_name}: {e}")
+            return None
+        except Exception as e:
+            if self._debug:
+                logging.debug(f"Error importing {module_name}: {e}")
+            return None
     
     @property
     def languages(self):
@@ -696,110 +730,204 @@ class PDFExtractor:
         self._ocr_initialized = {}
         self._available_methods = None
         
-        # Setup Windows paths
+        # Setup Windows paths first
         self._setup_windows_paths()
         
         # Check system dependencies
         self._binaries = self._check_system_dependencies()
         
-        # Check all dependencies
-        self._check_dependencies()
+        # Check core dependencies first to prioritize stable methods
+        self._check_core_dependencies()
         
+        # Only check OCR dependencies if debug mode is on or we have binaries
+        if debug or self._binaries.get('tesseract', False):
+            self._check_ocr_dependencies()
+        
+        if self._debug:
+            available = sorted(list(self._initialized_methods))
+            logging.debug(f"Available extraction methods: {', '.join(available)}")
+    
     def _check_system_dependencies(self) -> Dict[str, bool]:
-        """Check and install system dependencies"""
+        """Check system dependencies with proper binary detection"""
         binaries = {
             'tesseract': False,
             'poppler': False,
             'ghostscript': False
         }
         
-        system = platform.system()
-        
-        if system == 'Windows':
-            # Check Tesseract
+        if platform.system() == 'Windows':
+            # Check Tesseract (simple executable)
             tesseract_path = shutil.which('tesseract')
-            if not tesseract_path:
-                logging.info("Tesseract not found. Download from: https://github.com/UB-Mannheim/tesseract/wiki")
-                
-            # Check Poppler
-            pdftoppm_path = shutil.which('pdftoppm')
-            if not pdftoppm_path:
-                logging.info("Poppler not found. Download from: https://github.com/oschwartz10612/poppler-windows/releases/")
-                
-            # Check Ghostscript
-            gs_path = shutil.which('gs')
-            if not gs_path:
-                logging.info("Ghostscript not found. Download from: https://ghostscript.com/releases/gsdnld.html")
-                
+            
+            # Check Poppler (multiple possible executables)
+            pdftoppm_path = None
+            for exe in ['pdftoppm', 'pdftoppm.exe']:
+                path = shutil.which(exe)
+                if path:
+                    pdftoppm_path = path
+                    break
+            
+            # Check Ghostscript (multiple possible executables)
+            gs_path = None
+            for exe in ['gs', 'gswin64c', 'gswin64c.exe', 'gswin32c.exe']:
+                path = shutil.which(exe)
+                if path:
+                    gs_path = path
+                    break
+            
             # Update binary status
             binaries['tesseract'] = bool(tesseract_path)
             binaries['poppler'] = bool(pdftoppm_path)
             binaries['ghostscript'] = bool(gs_path)
             
-        return binaries
+            # Log discovered binaries
+            if self._debug:
+                found_binaries = []
+                if tesseract_path:
+                    found_binaries.append(f"Tesseract: {tesseract_path}")
+                if pdftoppm_path:
+                    found_binaries.append(f"Poppler: {pdftoppm_path}")
+                if gs_path:
+                    found_binaries.append(f"Ghostscript: {gs_path}")
+                
+                if found_binaries:
+                    logging.debug(f"Found binaries: {'; '.join(found_binaries)}")
+                
+            # Only show warnings for missing binaries once
+            if not tesseract_path and 'tesseract' not in self._initialized_methods:
+                logging.info("Tesseract not found. Download from: https://github.com/UB-Mannheim/tesseract/wiki")
+                
+            if not pdftoppm_path and 'poppler' not in self._initialized_methods:
+                logging.info("Poppler not found. Download from: https://github.com/oschwartz10612/poppler-windows/releases/")
+                
+            if not gs_path and 'ghostscript' not in self._initialized_methods:
+                logging.info("Ghostscript not found. Download from: https://ghostscript.com/releases/gsdnld.html")
         
-    def _check_dependencies(self):
-        """Check all possible dependencies"""
+        return binaries
+    
+    def _check_core_dependencies(self):
+        """Check core text extraction dependencies"""
+        # These are the most reliable methods, so check them first
         try:
-            # Core text extraction modules
             import fitz  # pymupdf
             self._initialized_methods.add('pymupdf')
+            if self._debug:
+                logging.debug("PyMuPDF (fitz) available")
         except ImportError:
             pass
 
         try:
             import pdfplumber
             self._initialized_methods.add('pdfplumber')
+            if self._debug:
+                logging.debug("pdfplumber available")
         except ImportError:
             pass
 
         try:
             import pypdf
             self._initialized_methods.add('pypdf')
+            if self._debug:
+                logging.debug("pypdf available")
         except ImportError:
             pass
 
         try:
-            import pdfminer
+            from pdfminer import high_level
             self._initialized_methods.add('pdfminer')
+            if self._debug:
+                logging.debug("pdfminer available")
         except ImportError:
             pass
-
-        # OCR-related checks
+    
+    def _check_ocr_dependencies(self):
+        """Check OCR-related dependencies separately"""
+        # OCR-related checks - these are more likely to cause issues
         try:
             import pytesseract
             import pdf2image
-            import shutil
-            if shutil.which('tesseract'):
-                self._initialized_methods.add('tesseract')
+            if self._binaries.get('tesseract', False):
+                # Verify tesseract works
+                try:
+                    pytesseract.get_tesseract_version()
+                    self._initialized_methods.add('tesseract')
+                    if self._debug:
+                        logging.debug("Tesseract OCR available")
+                except Exception as e:
+                    if self._debug:
+                        logging.debug(f"Tesseract not working: {e}")
         except ImportError:
             pass
 
-        try:
-            import doctr
-            self._initialized_methods.add('doctr')
-        except ImportError:
-            pass
-
-        try:
-            import easyocr
-            self._initialized_methods.add('easyocr')
-        except ImportError:
-            pass
-
-        try:
-            import kraken
-            self._initialized_methods.add('kraken')
-        except ImportError:
-            pass
-
+        # Skip problematic OCR dependencies in normal operation
+        # They'll be checked when actually needed
         if self._debug:
-            available = sorted(list(self._initialized_methods))
-            logging.debug(f"Available extraction methods: {', '.join(available)}")
+            try:
+                self._safe_import('doctr')
+                self._initialized_methods.add('doctr')
+                logging.debug("doctr available")
+            except Exception:
+                pass
+
+            try:
+                self._safe_import('easyocr')
+                self._initialized_methods.add('easyocr')
+                logging.debug("easyocr available")
+            except Exception:
+                pass
+
+            try:
+                self._safe_import('kraken')
+                self._initialized_methods.add('kraken')
+                logging.debug("kraken available")
+            except Exception:
+                pass
     
     def _is_method_available(self, method: str) -> bool:
         """Check if extraction method is available"""
-        return method in self._initialized_methods
+        # For core methods, use cached results
+        if method in self._initialized_methods:
+            return True
+            
+        # For OCR methods, check on demand if not already checked
+        if method in ['tesseract', 'doctr', 'easyocr', 'kraken'] and method not in self._initialized_methods:
+            try:
+                if method == 'tesseract':
+                    # Only check if tesseract binary exists
+                    if not self._binaries.get('tesseract', False):
+                        return False
+                    
+                    # Import required packages
+                    pytesseract = self._safe_import('pytesseract')
+                    pdf2image = self._safe_import('pdf2image')
+                    
+                    if pytesseract and pdf2image:
+                        try:
+                            pytesseract.get_tesseract_version()
+                            self._initialized_methods.add('tesseract')
+                            return True
+                        except Exception:
+                            return False
+                    return False
+                    
+                elif method == 'doctr':
+                    # Skip doctr - it's causing numpy compatibility issues
+                    return False
+                    
+                elif method == 'easyocr':
+                    # Skip easyocr - it's causing numpy compatibility issues
+                    return False
+                    
+                elif method == 'kraken':
+                    # Skip kraken - it's causing compatibility issues
+                    return False
+                    
+            except Exception as e:
+                if self._debug:
+                    logging.debug(f"Error checking {method}: {e}")
+                return False
+                
+        return False
         
     def set_password(self, password: str):
         """Set password for encrypted PDFs"""
@@ -856,11 +984,11 @@ class PDFExtractor:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"File not found: {pdf_path}")
             
-        # Start with fast methods, then fall back to slower ones if needed
-        methods = ['pymupdf', 'pdfplumber', 'pypdf']  # Fast methods first
+        # Start with reliable methods only
+        methods = ['pymupdf', 'pdfplumber', 'pypdf']  # Fast and reliable methods
         
-        # Only add OCR methods if text extraction fails
-        ocr_methods = ['tesseract', 'doctr', 'easyocr', 'kraken']
+        # Skip problematic OCR methods
+        ocr_methods = ['tesseract']  # Only include tesseract for OCR
         text_parts = []
         current_method = None
 
@@ -909,8 +1037,8 @@ class PDFExtractor:
                     if progress_callback and current_method == method:
                         progress_callback(1, None)
 
-            # Only try OCR if we didn't get good text and might need OCR
-            if not text_parts or self._might_need_ocr(pdf_path):
+            # Only try OCR as a last resort
+            if not text_parts and self._might_need_ocr(pdf_path):
                 if self._debug:
                     logging.info("Initial extraction insufficient, trying OCR methods...")
                 
@@ -1308,77 +1436,234 @@ class PDFExtractor:
                 output.close()
     
     def _init_ocr(self, method: str) -> bool:
-        """Initialize OCR engine with enhanced error handling"""
+        """Initialize OCR engine with enhanced error handling and dependency checks"""
         if method not in self._ocr_initialized:
+            # Early check - don't retry initialization if we've already determined it's unavailable
+            if method in self._ocr_failed_methods:
+                return False
+                
             try:
-                if method == 'kraken':
+                if method == 'tesseract':
+                    # Tesseract is the most reliable OCR method - try it first
                     try:
-                        import kraken.lib
-                        import kraken.binarization
-                        import kraken.pageseg
-                        import kraken.recognition
+                        # Check binary availability first before attempting imports
+                        if not shutil.which('tesseract'):
+                            if self._debug:
+                                logging.debug("Tesseract binary not found in PATH")
+                            self._ocr_initialized[method] = False
+                            return False
                         
-                        # Try alternate model loading approaches
+                        # Import dependencies
+                        pytesseract = self._safe_import('pytesseract')
+                        pdf2image = self._safe_import('pdf2image')
+                        PIL = self._safe_import('PIL.Image')
+                        
+                        if not (pytesseract and pdf2image and PIL):
+                            if self._debug:
+                                logging.debug("Missing dependencies for Tesseract OCR")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Verify Tesseract installation
                         try:
-                            from kraken.lib import models
-                            self._model = models.load_any("en-default.mlmodel")
-                        except (ImportError, AttributeError):
-                            try:
-                                from kraken.recognition import load_any
-                                self._model = load_any("en-default.mlmodel")
-                            except ImportError:
-                                raise ImportError("Could not find Kraken model loading function")
-                                
-                        self._ocr_initialized[method] = True
-                        
+                            version = pytesseract.get_tesseract_version()
+                            if self._debug:
+                                logging.debug(f"Found Tesseract version: {version}")
+                            self._ocr_initialized[method] = True
+                        except Exception as e:
+                            if self._debug:
+                                logging.debug(f"Tesseract verification failed: {e}")
+                            self._ocr_initialized[method] = False
+                            
                     except Exception as e:
-                        logging.error(f"Failed to initialize Kraken: {e}")
+                        if self._debug:
+                            logging.debug(f"Tesseract initialization error: {e}")
+                        self._ocr_initialized[method] = False
+                        
+                elif method == 'kraken':
+                    # Check if we should attempt kraken at all
+                    try:
+                        # Use safer try/except import rather than direct import
+                        kraken_lib = self._safe_import('kraken.lib')
+                        kraken_binarization = self._safe_import('kraken.binarization')
+                        kraken_pageseg = self._safe_import('kraken.pageseg')
+                        kraken_recognition = self._safe_import('kraken.recognition')
+                        
+                        if not (kraken_lib and kraken_binarization and kraken_pageseg and kraken_recognition):
+                            if self._debug:
+                                logging.debug("Missing one or more Kraken modules")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Try model loading with better error handling
+                        try:
+                            model = None
+                            
+                            # Approach 1: Try kraken.lib.models
+                            try:
+                                if hasattr(kraken_lib, 'models') and hasattr(kraken_lib.models, 'load_any'):
+                                    model = kraken_lib.models.load_any("en-default.mlmodel")
+                            except Exception as e:
+                                if self._debug:
+                                    logging.debug(f"Kraken model loading approach 1 failed: {e}")
+                            
+                            # Approach 2: Try kraken.recognition.load_any
+                            if not model and hasattr(kraken_recognition, 'load_any'):
+                                try:
+                                    model = kraken_recognition.load_any("en-default.mlmodel")
+                                except Exception as e:
+                                    if self._debug:
+                                        logging.debug(f"Kraken model loading approach 2 failed: {e}")
+                            
+                            if model:
+                                self._model = model
+                                self._ocr_initialized[method] = True
+                            else:
+                                if self._debug:
+                                    logging.debug("Could not load Kraken model")
+                                self._ocr_initialized[method] = False
+                                
+                        except Exception as e:
+                            if self._debug:
+                                logging.debug(f"Kraken model loading failed: {e}")
+                            self._ocr_initialized[method] = False
+                            
+                    except Exception as e:
+                        if self._debug:
+                            logging.debug(f"Kraken initialization failed: {e}")
                         self._ocr_initialized[method] = False
                         
                 elif method == 'doctr':
-                    import doctr
-                    import torch
+                    # Skip initialization on Windows if using Python 3.12 due to numpy/torch compatibility issues
+                    if platform.system() == 'Windows' and sys.version_info >= (3, 12):
+                        if self._debug:
+                            logging.debug("Skipping DocTR initialization - not compatible with Python 3.12 on Windows")
+                        self._ocr_initialized[method] = False
+                        return False
                     
-                    # Configure torch loading for security
-                    torch.set_warn_always(False)  # Suppress repeated warnings
-                    
-                    # Initialize DocTR with explicit device placement
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    self._predictor = doctr.models.ocr_predictor(pretrained=True).to(device)
-                    
-                    self._ocr_initialized[method] = True
-                    
-                elif method == 'easyocr':
-                    import easyocr
-                    import torch
-                    
-                    # Configure GPU settings
-                    gpu = torch.cuda.is_available()
-                    self._reader = easyocr.Reader(
-                        ['en'],
-                        gpu=gpu,
-                        model_storage_directory='./models',
-                        download_enabled=True
-                    )
-                    self._ocr_initialized[method] = True
-                    
-                elif method == 'tesseract':
-                    import pytesseract
-                    import pdf2image
-                    from PIL import Image
-                    
-                    # Verify Tesseract installation
                     try:
-                        pytesseract.get_tesseract_version()
-                        self._ocr_initialized[method] = True
-                    except pytesseract.TesseractNotFoundError:
-                        logging.error("Tesseract not found. Please install Tesseract OCR.")
+                        # Use safer imports
+                        doctr_module = self._safe_import('doctr')
+                        torch_module = self._safe_import('torch')
+                        
+                        if not (doctr_module and torch_module):
+                            if self._debug:
+                                logging.debug("Missing dependencies for DocTR")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Check if doctr has the required modules
+                        if not hasattr(doctr_module, 'models') or not hasattr(doctr_module.models, 'ocr_predictor'):
+                            if self._debug:
+                                logging.debug("DocTR missing required modules or functions")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Configure torch
+                        if hasattr(torch_module, 'set_warn_always'):
+                            torch_module.set_warn_always(False)
+                        
+                        # Pick device safely
+                        device = 'cpu'  # Default to CPU which is safer
+                        if torch_module.cuda.is_available():
+                            try:
+                                # Test CUDA before using it
+                                torch_module.zeros(1).cuda()
+                                device = 'cuda'
+                            except Exception as e:
+                                if self._debug:
+                                    logging.debug(f"CUDA available but failed initialization: {e}")
+                        
+                        # Initialize DocTR with timeout
+                        try:
+                            with timeout(30):  # 30 second timeout for model loading
+                                self._predictor = doctr_module.models.ocr_predictor(pretrained=True).to(device)
+                                self._ocr_initialized[method] = True
+                        except TimeoutError:
+                            if self._debug:
+                                logging.debug("DocTR initialization timed out")
+                            self._ocr_initialized[method] = False
+                        except Exception as e:
+                            if self._debug:
+                                logging.debug(f"DocTR predictor initialization failed: {e}")
+                            self._ocr_initialized[method] = False
+                            
+                    except Exception as e:
+                        if self._debug:
+                            logging.debug(f"DocTR initialization failed: {e}")
                         self._ocr_initialized[method] = False
                         
+                elif method == 'easyocr':
+                    # Skip initialization on Windows if using Python 3.12 due to numpy/torch compatibility issues
+                    if platform.system() == 'Windows' and sys.version_info >= (3, 12):
+                        if self._debug:
+                            logging.debug("Skipping EasyOCR initialization - not compatible with Python 3.12 on Windows")
+                        self._ocr_initialized[method] = False
+                        return False
+                        
+                    try:
+                        # Use safer imports
+                        easyocr_module = self._safe_import('easyocr')
+                        torch_module = self._safe_import('torch')
+                        
+                        if not (easyocr_module and torch_module):
+                            if self._debug:
+                                logging.debug("Missing dependencies for EasyOCR")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Check GPU safely
+                        gpu = False
+                        if torch_module.cuda.is_available():
+                            try:
+                                # Test CUDA before using it
+                                torch_module.zeros(1).cuda()
+                                gpu = True
+                            except Exception as e:
+                                if self._debug:
+                                    logging.debug(f"CUDA available but failed initialization: {e}")
+                        
+                        # Initialize Reader with timeout and try to prevent downloads
+                        try:
+                            with timeout(30):  # 30 second timeout for model loading
+                                self._reader = easyocr_module.Reader(
+                                    ['en'],
+                                    gpu=gpu,
+                                    model_storage_directory='./models',
+                                    download_enabled=False  # Try to prevent automatic downloads
+                                )
+                                self._ocr_initialized[method] = True
+                        except TimeoutError:
+                            if self._debug:
+                                logging.debug("EasyOCR initialization timed out")
+                            self._ocr_initialized[method] = False
+                        except Exception as e:
+                            if self._debug:
+                                logging.debug(f"EasyOCR reader initialization failed: {e}")
+                            self._ocr_initialized[method] = False
+                            
+                    except Exception as e:
+                        if self._debug:
+                            logging.debug(f"EasyOCR initialization failed: {e}")
+                        self._ocr_initialized[method] = False
+                else:
+                    # Unsupported method
+                    if self._debug:
+                        logging.debug(f"Unsupported OCR method: {method}")
+                    self._ocr_initialized[method] = False
+                    
             except Exception as e:
-                logging.error(f"Failed to initialize {method}: {e}")
+                # Catch all other errors
+                if self._debug:
+                    logging.debug(f"Failed to initialize {method}: {e}")
                 self._ocr_initialized[method] = False
                 
+                # Remember methods that failed initialization to avoid repeated attempts
+                if not hasattr(self, '_ocr_failed_methods'):
+                    self._ocr_failed_methods = set()
+                self._ocr_failed_methods.add(method)
+        
+        # Return cached result
         return self._ocr_initialized.get(method, False)
 
     def extract_with_tesseract(self, pdf_path: str, progress_callback=None) -> str:

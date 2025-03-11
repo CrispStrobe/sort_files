@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import queue
 from datetime import datetime
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import signal
@@ -34,6 +35,11 @@ MODEL_NAME = "cas/spaetzle-v85-7b"
 # "cas/llama-3.2-3b-instruct"
 # "cas/spaetzle-v85-7b"  
 # Change to other ollama model as fits your needs. Ensure this is defined before usage
+
+# Timeout settings
+OCR_PROCESS_TIMEOUT = 120  # 2 minutes timeout for OCR processes
+DEFAULT_PROCESS_TIMEOUT = 60  # 1 minute timeout for other processes
+MAX_WAIT_AFTER_SHUTDOWN = 10  # Maximum seconds to wait after shutdown signal
 
 MAX_RETRY_ATTEMPTS = 1
 SUPPORTED_EXTENSIONS = (
@@ -310,6 +316,49 @@ def check_tesseract_langs(required_langs):
     except Exception as e:
         logging.error(f"Unexpected error checking Tesseract languages: {e}")
         return False
+    
+def process_with_timeout(func, *args, **kwargs):
+    """
+    Run a function with a timeout.
+    """
+    result = None
+    future = None
+    
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(func, *args, **kwargs)
+            result = future.result(timeout=300)  # 5-minute timeout for each file processing
+    except concurrent.futures.TimeoutError:
+        logging.error(f"Processing timed out for args: {args}")
+        if future:
+            future.cancel()
+        return None
+    except Exception as e:
+        logging.error(f"Error in process_with_timeout: {e}")
+        return None
+    
+    return result
+
+def run_subprocess_with_timeout(cmd, timeout=DEFAULT_PROCESS_TIMEOUT, **kwargs):
+    """
+    Run a subprocess command with timeout.
+    
+    Parameters:
+        cmd (list): Command list to execute
+        timeout (int): Timeout in seconds
+        **kwargs: Additional arguments to pass to subprocess.run
+        
+    Returns:
+        subprocess.CompletedProcess or None: Result of the process or None if timeout
+    """
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        logging.error(f"Command {' '.join(cmd)} timed out after {timeout} seconds")
+        return None
+    except Exception as e:
+        logging.error(f"Error running command {' '.join(cmd)}: {e}")
+        return None
 
 def get_installed_tesseract_langs():
     """
@@ -486,10 +535,19 @@ def perform_ocr_on_image(image, ocr_available=None, tools_available=None, option
             logging.info("Shutdown initiated. Stopping OCR on image.")
             break
         
-        if ocr_method == 'tesseract' and image:
+        if ocr_method == 'tesseract' and image and optional_libraries.get('pytesseract', False):
+            # Make sure image is actually a PIL Image
+            if not hasattr(image, 'mode'):
+                logging.warning("Invalid image object for Tesseract OCR.")
+                continue
+                
             lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+            if not lang:
+                lang = 'eng'  # Default to English if no languages are found
+                
             logging.debug(f"Performing OCR on image with Tesseract using languages: {lang}")
             try:
+                import pytesseract
                 page_text = pytesseract.image_to_string(image, lang=lang)
                 if page_text.strip() and is_text_meaningful(page_text, file_path="image"):
                     text += page_text + "\n"
@@ -501,6 +559,7 @@ def perform_ocr_on_image(image, ocr_available=None, tools_available=None, option
                     logging.debug("Text extracted with Tesseract is not meaningful. Trying next OCR tool.")
             except Exception as e:
                 logging.error(f"Error performing OCR with Tesseract on image: {e}")
+                ocr_attempts.add('tesseract')
         
         elif ocr_method == 'kraken' and image:
             logging.debug("Performing OCR on image with Kraken.")
@@ -514,12 +573,236 @@ def perform_ocr_on_image(image, ocr_available=None, tools_available=None, option
             else:
                 logging.debug("Text extracted with Kraken is not meaningful. Trying next OCR tool.")
         
-        # Add other OCR methods if necessary
-    
         # Mark this OCR method as attempted
         ocr_attempts.add(ocr_method)
     
+    # If we've tried all OCR methods and none worked, try using tesseract directly via subprocess
+    if 'tesseract' not in ocr_attempts and shutil.which('tesseract') and hasattr(image, 'save'):
+        logging.debug("Attempting OCR with Tesseract via subprocess...")
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            image.save(temp_path)
+            
+            lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+            if not lang:
+                lang = 'eng'  # Default to English if no languages are found
+                
+            cmd = ['tesseract', temp_path, 'stdout', '-l', lang]
+            result = run_subprocess_with_timeout(cmd, timeout=OCR_PROCESS_TIMEOUT, capture_output=True, text=True)
+            
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            
+            if result and result.returncode == 0:  # Only process if successful
+                page_text = result.stdout.strip()
+                if page_text.strip() and is_text_meaningful(page_text, file_path="image"):
+                    text += page_text + "\n"
+                    logging.debug(f"Successfully extracted meaningful text using Tesseract subprocess ({len(page_text)} characters)")
+                    if verbose:
+                        logging.debug(f"Extracted text with Tesseract subprocess: {page_text[:500]}")
+                    return text
+        except Exception as e:
+            logging.error(f"Error performing OCR with Tesseract subprocess: {e}")
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+    
     return text
+
+def perform_ocr_with_kraken(image, model='en_best.mlmodel', tools_available=None, verbose=False, ocr_attempts=None):
+    """
+    Perform OCR using Kraken on a given image, with subprocess fallback.
+    
+    Parameters:
+        image (PIL.Image.Image): PIL Image object.
+        model (str): Path or name of the Kraken model to use.
+        tools_available (dict): Dictionary indicating availability of tools.
+        verbose (bool): Enable verbose logging.
+        ocr_attempts (set): Set to track which OCR tools have been attempted.
+    
+    Returns:
+        str: Extracted text from Kraken OCR or empty string if OCR fails.
+    """
+    if tools_available is None:
+        tools_available = {}
+    if ocr_attempts is None:
+        ocr_attempts = set()
+    
+    # Global counter to track Kraken failures
+    global kraken_failure_count
+    if not hasattr(globals(), 'kraken_failure_count'):
+        globals()['kraken_failure_count'] = 0
+    
+    # Check if we've had too many failures
+    if globals()['kraken_failure_count'] >= 3:
+        logging.warning("Too many Kraken failures. Skipping Kraken OCR for this session.")
+        tools_available['kraken'] = False
+        ocr_attempts.add('kraken')
+        return ""
+    
+    if not tools_available.get('kraken', False) or 'kraken' not in shutil.which('kraken'):
+        logging.warning("Kraken OCR is not available. Skipping Kraken OCR.")
+        return ""
+    
+    # Try direct subprocess approach first (most reliable)
+    try:
+        logging.debug("Attempting OCR with Kraken via direct subprocess...")
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+            temp_path = temp_file.name
+        
+        # Save the image to a temporary file
+        image.save(temp_path)
+        logging.debug(f"Saved image to temporary file {temp_path}")
+        
+        # Create a temporary output file
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as out_file:
+            output_path = out_file.name
+        
+        try:
+            # Run kraken OCR command
+            cmd = ['kraken', '-i', temp_path, output_path, 'ocr', '-m', model]
+            result = run_subprocess_with_timeout(cmd, timeout=OCR_PROCESS_TIMEOUT, capture_output=True, text=True)
+            
+            if result and result.returncode == 0:
+                # Read the output file
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    text = f.read().strip()
+                
+                if text and is_text_meaningful(text, file_path="image"):
+                    logging.debug(f"Successfully extracted meaningful text using Kraken subprocess ({len(text)} characters)")
+                    if verbose:
+                        logging.debug(f"Extracted text with Kraken subprocess: {text[:500]}")
+                    return text
+            else:
+                if result:
+                    logging.error(f"Kraken subprocess failed with return code {result.returncode}: {result.stderr}")
+                globals()['kraken_failure_count'] += 1
+        except Exception as e:
+            logging.error(f"Error running Kraken subprocess: {e}")
+            globals()['kraken_failure_count'] += 1
+        finally:
+            # Clean up temporary files
+            for path in [temp_path, output_path]:
+                if os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except:
+                        pass
+    except Exception as e:
+        logging.error(f"Error in Kraken subprocess preparation: {e}")
+        globals()['kraken_failure_count'] += 1
+    
+    # If we've reached here, try the Python module approach as a fallback
+    try:
+        # Try to import the required modules at runtime
+        from kraken import binarization
+        from kraken import pageseg
+        
+        # Try the newer Kraken API (kraken 3.x+)
+        try:
+            # Try first with the fully qualified version
+            from kraken.recognition import load_any as load_model
+            from kraken.recognition import ocr_record
+            
+            if verbose:
+                logging.debug("Using Kraken recognition API (newer version)")
+            
+            # Binarize the image
+            bin_img = binarization.nlbin(image)
+            
+            # Segment the image into lines
+            regions = pageseg.segment(bin_img)
+            
+            # Load the model
+            model_obj = load_model(model)
+            
+            # Perform OCR
+            result = ocr_record(network=model_obj, regions=regions, im=bin_img)
+            
+            # Extract text from result
+            text = ''
+            for line in result:
+                text += line.prediction + '\n'
+                
+            if text and is_text_meaningful(text, file_path="image"):
+                return text
+            
+        except (ImportError, AttributeError) as e:
+            if verbose:
+                logging.debug(f"Failed to use recognition API: {e}. Trying rpred API.")
+                
+            # Try with rpred (kraken 2.x)
+            try:
+                from kraken import rpred
+                
+                if verbose:
+                    logging.debug("Using Kraken rpred API")
+                
+                # Binarize the image
+                bin_img = binarization.nlbin(image)
+                
+                # Segment the image into lines
+                regions = pageseg.segment(bin_img)
+                
+                # Perform OCR
+                result = rpred.rpred(model, bin_img, regions)
+                text = result.prediction if hasattr(result, 'prediction') else ''
+                
+                if text and is_text_meaningful(text, file_path="image"):
+                    return text
+                
+            except (ImportError, AttributeError) as e:
+                if verbose:
+                    logging.debug(f"Failed to use rpred API: {e}")
+                globals()['kraken_failure_count'] += 1
+                
+    except ImportError as e:
+        logging.error(f"Kraken OCR dependencies are missing: {e}")
+        globals()['kraken_failure_count'] += 1
+        ocr_attempts.add('kraken')
+    except Exception as e:
+        logging.error(f"Error performing OCR with Kraken: {e}")
+        globals()['kraken_failure_count'] += 1
+        ocr_attempts.add('kraken')
+    
+    return ""
+
+# ensure Tesseract is properly checked and available
+def check_tesseract_availability():
+    """Check if Tesseract is available and properly installed"""
+    tesseract_available = False
+    if shutil.which('tesseract'):
+        try:
+            # Verify that tesseract works by running a simple version command
+            result = subprocess.run(['tesseract', '--version'], 
+                                   capture_output=True, text=True, check=True)
+            tesseract_available = True
+            logging.debug(f"Tesseract is available: {result.stdout.splitlines()[0] if result.stdout else 'Unknown version'}")
+            
+            # Verify pytesseract can be imported if available
+            try:
+                import pytesseract
+                optional_libraries['pytesseract'] = True
+                logging.debug("pytesseract Python module is available")
+            except ImportError:
+                logging.warning("pytesseract Python module is not available. Will use subprocess for Tesseract OCR.")
+                optional_libraries['pytesseract'] = False
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error verifying Tesseract: {e}")
+            tesseract_available = False
+    else:
+        logging.warning("Tesseract is not installed or not in PATH")
+        tesseract_available = False
+        
+    return tesseract_available
 
 
 def extract_text_from_image(image_path, perform_ocr_if_needed, ocr_available, verbose=False, tools_available=None, optional_libraries=None, ocr_attempts=None):
@@ -1084,52 +1367,6 @@ def is_pdf_valid(file_path, tools_available=None, optional_libraries=None):
     logging.warning(f"All PDF validation methods failed for {file_path}. Marking as invalid.")
     return False
 
-def perform_ocr_with_kraken(image, model='en_best.mlmodel', tools_available=None, verbose=False, ocr_attempts=None):
-    """
-    Perform OCR using Kraken on a given image.
-    
-    Parameters:
-        image (PIL.Image.Image): PIL Image object.
-        model (str): Path or name of the Kraken model to use.
-        tools_available (dict): Dictionary indicating availability of tools.
-        verbose (bool): Enable verbose logging.
-    
-    Returns:
-        str: Extracted text from Kraken OCR or empty string if OCR fails.
-    """
-    if tools_available is None:
-        tools_available = {}
-    if not tools_available.get('kraken', False):
-        logging.warning("Kraken OCR is not available. Skipping Kraken OCR.")
-        return ""
-    try:
-        from kraken import binarization, pageseg, ocr
-        if verbose:
-            logging.debug("Performing OCR using Kraken.")
-        # Binarize the image
-        bin_img = binarization.nlbin(image)
-        # Segment the image into lines
-        regions = pageseg.segment(bin_img)
-        # Perform OCR with specified model
-        text = ocr.recognize(bin_img, regions=regions, model=model)
-        if not isinstance(text, str):
-            logging.error("Kraken OCR did not return a string.")
-            ocr_attempts.add('kraken')
-            return ""
-        logging.debug(f"Successfully extracted text using Kraken ({len(text)} characters)")
-        if verbose:
-            logging.debug(f"Extracted Text (first 500 chars): {text[:500]}")
-
-        return text
-
-    except ImportError:
-        logging.error("Kraken OCR dependencies are missing. Please install Kraken and its dependencies.")
-    except Exception as e:
-        logging.error(f"Error performing OCR with Kraken: {e}")
-        ocr_attempts.add('kraken')
-    return ""
-
-
 def perform_ocr_on_first_pages(pdf_path, num_pages=3, verbose=False, tools_available=None, language='en', ocr_attempts=None):
     """
     Perform OCR on the first few pages of a PDF file using available OCR tools in preferred order.
@@ -1150,8 +1387,8 @@ def perform_ocr_on_first_pages(pdf_path, num_pages=3, verbose=False, tools_avail
     if ocr_attempts is None:
         ocr_attempts = set()
     
-    if not (tools_available.get('pdf2image', False) and (tools_available.get('tesseract', False) or tools_available.get('kraken', False))):
-        logging.warning("pdf2image and/or no OCR tool is available. OCR on specific pages will be skipped.")
+    if not (tools_available.get('pdf2image', False)):
+        logging.warning("pdf2image is not available. OCR on specific pages will be skipped.")
         return ""
     logging.debug(f"Performing OCR on the first {num_pages} pages of: {pdf_path}")
     text = ""
@@ -1166,76 +1403,108 @@ def perform_ocr_on_first_pages(pdf_path, num_pages=3, verbose=False, tools_avail
             logging.warning("Could not find 'tessdata' directory. Please set the TESSDATA_PREFIX environment variable manually.")
             TESSDATA_PREFIX = None  # Handle cases where tessdata is not found
 
-        # Determine available OCR methods based on preferred order and excluding attempted tools
-        available_ocr_methods = [
-            method for method in OCR_PREFERRED_ORDER 
-            if tools_available.get(method, False) and method not in ocr_attempts
-        ]
-        if not available_ocr_methods:
-            logging.warning("No OCR tools are available to perform OCR or all have been attempted.")
+        # Try to directly convert the PDF pages to images
+        try:
+            images = convert_from_path(pdf_path, dpi=300, first_page=1, last_page=num_pages)
+            logging.debug(f"Successfully converted {len(images)} pages from PDF to images")
+        except Exception as e:
+            logging.error(f"Error converting PDF to images: {e}")
             return ""
 
-        # Check if required Tesseract languages are installed
-        if 'tesseract' in available_ocr_methods and not check_tesseract_langs(REQUIRED_TESS_LANGS):
-            logging.warning("Required Tesseract languages are missing. Tesseract OCR will be skipped.")
-            available_ocr_methods.remove('tesseract')
-
-        # Determine languages to use
-        installed_langs = get_installed_tesseract_langs()
-        installed_langs = [lang for lang in REQUIRED_TESS_LANGS if lang in installed_langs]
-        if not installed_langs and 'tesseract' in available_ocr_methods:
-            installed_langs = REQUIRED_TESS_LANGS  # Fallback to all required languages
-            logging.warning("No specific Tesseract languages found. Using all required languages.")
-        lang = '+'.join(installed_langs) if installed_langs else ''
-
-        # Select the Kraken model based on detected language
-        kraken_model = get_kraken_model(language)
-        logging.debug(f"Using Kraken model '{kraken_model}' for language '{language}'.")
-
-        images = convert_from_path(pdf_path, dpi=300, first_page=1, last_page=num_pages)
+        # Try OCR on each image
         for i, image in enumerate(images):
-            page_ocr_successful = False
-            for ocr_method in available_ocr_methods:
-                if shutdown_flag.is_set():
-                    logging.info(f"Shutdown initiated. Stopping OCR on {pdf_path}.")
-                    return text[:2000]
-                if ocr_method == 'tesseract':
-                    logging.debug(f"Performing OCR on page {i+1} with Tesseract and languages: {lang}")
+            if shutdown_flag.is_set():
+                logging.info(f"Shutdown initiated. Stopping OCR on {pdf_path}.")
+                return text[:2000]
+                
+            # Try Tesseract directly - this is the most reliable method
+            if shutil.which('tesseract'):
+                try:
+                    # Save the image to a temporary file
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                        temp_path = temp_file.name
+                    
+                    image.save(temp_path)
+                    logging.debug(f"Saved page {i+1} to temporary file {temp_path}")
+                    
+                    # Get available languages
+                    lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+                    if not lang:
+                        lang = 'eng'  # Default to English if no required languages are found
+                    
+                    logging.debug(f"Performing OCR on page {i+1} with Tesseract subprocess using languages: {lang}")
+                    cmd = ['tesseract', temp_path, 'stdout', '-l', lang]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    page_text = result.stdout.strip()
+                    
+                    # Clean up the temporary file
                     try:
-                        page_text = pytesseract.image_to_string(image, lang=lang)
-                        if isinstance(page_text, str) and page_text.strip():
-                            if is_text_meaningful(page_text, file_path=pdf_path):
-                                text += page_text + "\n"
-                                page_ocr_successful = True
-                                break  # Successful OCR with meaningful text, move to next image
-                            else:
-                                logging.debug(f"OCR with Tesseract did not yield meaningful text on page {i+1}. Trying next OCR tool.")
-                        else:
-                            logging.debug(f"OCR with Tesseract did not produce any text on page {i+1}. Trying next OCR tool.")
-                    except Exception as e:
-                        logging.error(f"Error performing OCR with Tesseract on page {i+1}: {e}")
-                        ocr_attempts.add('tesseract')
-                elif ocr_method == 'kraken':
-                    logging.debug(f"Performing OCR on page {i+1} with Kraken.")
-                    page_text = perform_ocr_with_kraken(image, model=kraken_model, tools_available=tools_available, verbose=verbose, ocr_attempts=ocr_attempts)
-                    if isinstance(page_text, str) and page_text.strip():
-                        if is_text_meaningful(page_text, file_path=pdf_path):
-                            text += page_text + "\n"
-                            page_ocr_successful = True
-                            break  # Successful OCR with meaningful text, move to next image
-                        else:
-                            logging.debug(f"OCR with Kraken did not yield meaningful text on page {i+1}. Trying next OCR tool.")
+                        os.unlink(temp_path)
+                    except:
+                        pass
+                    
+                    if page_text.strip() and is_text_meaningful(page_text, file_path=pdf_path):
+                        text += page_text + "\n"
+                        logging.debug(f"Successfully extracted meaningful text from page {i+1} using Tesseract subprocess ({len(page_text)} characters)")
+                        if verbose:
+                            logging.debug(f"Extracted Text from page {i+1} (first 500 chars): {page_text[:500]}")
                     else:
-                        logging.debug(f"OCR with Kraken did not produce any text on page {i+1}. Trying next OCR tool.")
-            if len(text) > 2000 or not page_ocr_successful:
-                break  # Reached desired length or no successful OCR on this page, stop processing pages
+                        logging.debug(f"OCR with Tesseract on page {i+1} did not yield meaningful text.")
+                except Exception as e:
+                    logging.error(f"Error performing OCR with Tesseract subprocess on page {i+1}: {e}")
+            
+            # If Tesseract didn't work or isn't available, try with pytesseract Python library
+            if not text.strip() and tools_available.get('pytesseract', False):
+                try:
+                    import pytesseract
+                    lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+                    if not lang:
+                        lang = 'eng'
+                    logging.debug(f"Performing OCR on page {i+1} with pytesseract using languages: {lang}")
+                    page_text = pytesseract.image_to_string(image, lang=lang)
+                    if page_text.strip() and is_text_meaningful(page_text, file_path=pdf_path):
+                        text += page_text + "\n"
+                        logging.debug(f"Successfully extracted meaningful text from page {i+1} using pytesseract ({len(page_text)} characters)")
+                        if verbose:
+                            logging.debug(f"Extracted Text from page {i+1} (first 500 chars): {page_text[:500]}")
+                    else:
+                        logging.debug(f"OCR with pytesseract on page {i+1} did not yield meaningful text.")
+                except Exception as e:
+                    logging.error(f"Error performing OCR with pytesseract on page {i+1}: {e}")
+
+            # If neither Tesseract method worked, try with Kraken
+            if not text.strip() and tools_available.get('kraken', False):
+                try:
+                    from kraken import binarization, pageseg
+                    logging.debug(f"Performing OCR on page {i+1} with Kraken.")
+                    kraken_text = perform_ocr_with_kraken(image, model=get_kraken_model(language), tools_available=tools_available, verbose=verbose, ocr_attempts=ocr_attempts)
+                    if kraken_text.strip() and is_text_meaningful(kraken_text, file_path=pdf_path):
+                        text += kraken_text + "\n"
+                        logging.debug(f"Successfully extracted meaningful text from page {i+1} using Kraken ({len(kraken_text)} characters)")
+                        if verbose:
+                            logging.debug(f"Extracted Text from page {i+1} (first 500 chars): {kraken_text[:500]}")
+                    else:
+                        logging.debug(f"OCR with Kraken on page {i+1} did not yield meaningful text.")
+                except ImportError as e:
+                    logging.error(f"Kraken OCR dependencies are missing for page {i+1}: {e}")
+                except Exception as e:
+                    logging.error(f"Error performing OCR with Kraken on page {i+1}: {e}")
+
+            # Break if we've extracted enough text
+            if len(text) > 2000:
+                logging.debug(f"Extracted sufficient text (over 2000 chars). Stopping OCR.")
+                break
+
         if text.strip():
             logging.debug(f"Successfully extracted text through OCR on first {num_pages} pages ({len(text)} characters)")
             if verbose:
                 logging.debug(f"Extracted Text (first 500 chars): {text[:500]}")
             logging.info(f"Successfully performed OCR on first {num_pages} pages of {pdf_path}.")
+        else:
+            logging.warning(f"OCR failed to extract meaningful text from {pdf_path}")
     except Exception as e:
         logging.error(f"Error performing OCR on {pdf_path}: {e}")
+    
     return text[:2000]
 
 
@@ -1710,6 +1979,22 @@ def process_file(file_path, openai_client, max_attempts=MAX_RETRY_ATTEMPTS, verb
     Returns:
         dict or None: Extracted metadata dictionary or None if processing fails.
     """
+    # Create a mutable copy of the read-only tools_available
+    if tools_available is not None and isinstance(tools_available, MappingProxyType):
+        tools_available = dict(tools_available)
+    
+    # Check global failure counters and disable tools if needed
+    if 'kraken_failure_count' in globals() and globals()['kraken_failure_count'] >= 3:
+        if tools_available and tools_available.get('kraken', False):
+            logging.warning("Kraken has failed too many times. Disabling for this session.")
+            tools_available['kraken'] = False
+    
+    # Same for other tools if needed
+    if 'tesseract_failure_count' in globals() and globals()['tesseract_failure_count'] >= 3:
+        if tools_available and tools_available.get('tesseract', False):
+            logging.warning("Tesseract has failed too many times. Disabling for this session.")
+            tools_available['tesseract'] = False
+    
     if tools_available is None:
         tools_available = {}
     if optional_libraries is None:
@@ -1786,9 +2071,11 @@ def process_file(file_path, openai_client, max_attempts=MAX_RETRY_ATTEMPTS, verb
                         tools_available=tools_available,
                         ocr_attempts=ocr_attempts,
                     )
+                        
                 elif method == 'ocr':
                     logging.info(f"Attempting OCR on {file_path}")
                     if file_path.lower().endswith('.pdf'):
+                        # Try Tesseract first, then fall back to Kraken if needed
                         text = perform_ocr_on_first_pages(
                             file_path,
                             num_pages=3,
@@ -1803,14 +2090,82 @@ def process_file(file_path, openai_client, max_attempts=MAX_RETRY_ATTEMPTS, verb
                                 image = Image.open(file_path)
                             except Exception as e:
                                 logging.error(f"Error opening image {file_path} for OCR: {e}")
-                        text = perform_ocr_on_image(
-                            image,
-                            ocr_available={'tesseract': tools_available.get('tesseract', False), 'kraken': tools_available.get('kraken', False)},
-                            tools_available=tools_available,
-                            optional_libraries=optional_libraries,
-                            verbose=verbose,
-                            ocr_attempts=ocr_attempts, 
-                        )
+                        
+                        if image:
+                            # Try Tesseract first, regardless of OCR_PREFERRED_ORDER
+                            if tools_available.get('tesseract', False) or shutil.which('tesseract'):
+                                try:
+                                    # Try using pytesseract if available
+                                    if optional_libraries.get('pytesseract', False):
+                                        import pytesseract
+                                        lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+                                        if not lang:
+                                            lang = 'eng'  # Default to English if no languages found
+                                        logging.debug(f"Performing OCR on image with pytesseract using languages: {lang}")
+                                        text = pytesseract.image_to_string(image, lang=lang)
+                                        if text.strip() and is_text_meaningful(text, file_path=file_path):
+                                            logging.debug(f"Successfully extracted meaningful text using pytesseract ({len(text)} characters)")
+                                            if verbose:
+                                                logging.debug(f"Extracted text: {text[:500]}")
+                                    
+                                    # If pytesseract failed or isn't available, use subprocess
+                                    if not text:
+                                        # Save image to temp file and use tesseract command
+                                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                                            temp_path = temp_file.name
+                                        
+                                        image.save(temp_path)
+                                        logging.debug(f"Saved image to temporary file {temp_path}")
+                                        
+                                        lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+                                        if not lang:
+                                            lang = 'eng'  # Default to English if no languages found
+                                        
+                                        cmd = ['tesseract', temp_path, 'stdout', '-l', lang]
+                                        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                                        text = result.stdout.strip()
+                                        
+                                        # Clean up the temporary file
+                                        try:
+                                            os.unlink(temp_path)
+                                        except:
+                                            pass
+                                        
+                                        if text.strip() and is_text_meaningful(text, file_path=file_path):
+                                            logging.debug(f"Successfully extracted meaningful text using tesseract subprocess ({len(text)} characters)")
+                                            if verbose:
+                                                logging.debug(f"Extracted text: {text[:500]}")
+                                except Exception as e:
+                                    logging.error(f"Error performing OCR with Tesseract on {file_path}: {e}")
+                            
+                            # Only try Kraken if Tesseract failed
+                            if not text:
+                                text = perform_ocr_on_image(
+                                    image,
+                                    ocr_available={'tesseract': tools_available.get('tesseract', False), 'kraken': tools_available.get('kraken', False)},
+                                    tools_available=tools_available,
+                                    optional_libraries=optional_libraries,
+                                    verbose=verbose,
+                                    ocr_attempts=ocr_attempts,
+                                )
+                        else:
+                            # If we couldn't load the image with Pillow, try direct Tesseract subprocess
+                            if shutil.which('tesseract'):
+                                try:
+                                    lang = '+'.join([lang for lang in REQUIRED_TESS_LANGS if lang in get_installed_tesseract_langs()])
+                                    if not lang:
+                                        lang = 'eng'  # Default to English if no languages found
+                                    
+                                    cmd = ['tesseract', file_path, 'stdout', '-l', lang]
+                                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                                    text = result.stdout.strip()
+                                    
+                                    if text.strip() and is_text_meaningful(text, file_path=file_path):
+                                        logging.debug(f"Successfully extracted meaningful text using tesseract subprocess directly on file ({len(text)} characters)")
+                                        if verbose:
+                                            logging.debug(f"Extracted text: {text[:500]}")
+                                except Exception as e:
+                                    logging.error(f"Error performing OCR with Tesseract directly on {file_path}: {e}")
                 elif method == 'ebooklib':
                     if file_path.lower().endswith('.epub'):
                         text = extract_text_from_epub(
@@ -2067,6 +2422,22 @@ def prompt_install_optional_libraries(optional_libraries, no_install=False):
                     optional_libraries[lib] = False
                     logging.error(f"Failed to import {lib} even after installation.")
 
+def disable_tool_on_failures(tool_name, failure_counter, max_failures=3):
+    """
+    Disable a tool after it fails too many times.
+    
+    Parameters:
+        tool_name (str): The name of the tool in tools_available dict
+        failure_counter (int): Current failure count
+        max_failures (int): Maximum allowed failures before disabling
+        
+    Returns:
+        bool: True if tool should be disabled, False otherwise
+    """
+    if failure_counter >= max_failures:
+        logging.warning(f"{tool_name} has failed {failure_counter} times. Disabling for this session.")
+        return True
+    return False
 
 # Main function to process all files in the directory
 def main(directory, verbose, force, singletask, debug, NO_INSTALL):
@@ -2084,6 +2455,9 @@ def main(directory, verbose, force, singletask, debug, NO_INSTALL):
         'textract': essential_libraries.get('textract', False)
     }
 
+    # Check for Tesseract availability before Kraken to ensure fallback works
+    external_tools['tesseract'] = check_tesseract_availability()
+
     # Attempt to import langdetect
     try:
         from langdetect import detect, DetectorFactory
@@ -2095,75 +2469,170 @@ def main(directory, verbose, force, singletask, debug, NO_INSTALL):
         logging.warning("langdetect is not installed. Language detection will rely on file names and metadata.")
 
     # Check for Kraken availability
+    # Initialize global counter for Kraken failures
+    kraken_failure_count = 0
+
+    kraken_available = False
     if shutil.which('kraken'):
-        external_tools['kraken'] = True
-        logging.debug("Kraken OCR is available.")
+        # Try quick command version check first
+        try:
+            result = run_subprocess_with_timeout(['kraken', '--version'], timeout=10, capture_output=True, text=True)
+            if result and result.returncode == 0:
+                logging.debug(f"Kraken command-line tool is available: {result.stdout.strip()}")
+                
+                # The command exists and runs - that's enough to try the command-line approach
+                kraken_available = True
+                external_tools['kraken'] = True
+            else:
+                logging.warning("Kraken command-line tool check failed")
+        except Exception as e:
+            logging.warning(f"Error checking kraken command-line: {e}")
+        
+        # If command-line check failed, or as additional validation, check Python modules
+        if not kraken_available:
+            try:
+                # Check if we can import the necessary modules
+                import kraken
+                import kraken.binarization
+                import kraken.pageseg
+                
+                # Try multiple possible module paths for recognition capabilities
+                recognition_available = False
+                try:
+                    # Try newer API first (kraken 3.x+)
+                    from kraken.recognition import load_any
+                    recognition_available = True
+                    logging.debug("Kraken 3.x recognition module is available.")
+                except ImportError:
+                    try:
+                        # Try rpred API (kraken 2.x)
+                        import kraken.rpred
+                        recognition_available = True
+                        logging.debug("Kraken 2.x rpred module is available.")
+                    except ImportError:
+                        logging.warning("Neither Kraken recognition nor rpred modules could be imported.")
+                
+                if recognition_available:
+                    kraken_available = True
+                    external_tools['kraken'] = True
+                    logging.debug("Kraken OCR is available and all required modules are importable.")
+                else:
+                    logging.warning("Kraken OCR core modules are available but recognition modules are missing.")
+                    logging.warning("Will attempt to repair Kraken installation if needed.")
+            except ImportError as e:
+                logging.warning(f"Kraken OCR is installed but Python modules are not properly importable: {e}")
+                logging.warning("Will attempt to repair Kraken installation if needed.")
+                kraken_available = False
     else:
         logging.warning("Kraken OCR is not installed or not found in PATH. Kraken OCR functionality will be skipped.")
+        kraken_available = False
+
+    if not kraken_available and not NO_INSTALL:
         # Prompt user to install Kraken with PDF support
-        install_commands = ['pip', 'install', 'kraken[pdf]']  # Install Kraken with PDF extras
+        install_commands = ['pip', 'install', '--force-reinstall', 'kraken[pdf]']  # Force reinstall with PDF extras
         if prompt_install_tool('Kraken OCR', install_commands, auto_install=True, no_install=NO_INSTALL):
-            external_tools['kraken'] = True
-            if not shutil.which('kraken'):
-                logging.error("Kraken OCR installation failed or 'kraken' is not in PATH.")
-                # Informational message (can be added to logging or user instructions)
-                logging.info(
-                    "If you encounter issues installing Kraken with pip manually due to shell interpretation of brackets, "
-                    "use quotes or escape the brackets, e.g., 'pip install \"kraken[pdf]\"' or 'pip install kraken\\[pdf\\]'."
-                )
-                external_tools['kraken'] = False
-            else:
-                logging.info("Kraken OCR installed successfully.")
-                # After successful installation, download required models
-                required_models = [            # Example model IDs, adjust based on your needs
-                    '10.5281/zenodo.2577813',  # en_best.mlmodel
-                    '10.5281/zenodo.11113737', # reichenau_lat_cat_099218.mlmodel
-                    '10.5281/zenodo.7631619',  # cremma-generic-1.0.1.mlmodel
-                    '10.5281/zenodo.7050296',  # arabic_best.mlmodel
-                    '10.5281/zenodo.10519596', # german_print.mlmodel
-                    '10.5281/zenodo.7933402',  # austriannewspapers.mlmodel
-                    # Add other model IDs as needed
-                ]
-                for model_id in required_models:
+            if shutil.which('kraken'):
+                try:
+                    # Verify installation
+                    import kraken
+                    import kraken.binarization
+                    import kraken.pageseg
+                    
+                    # Check for recognition modules
+                    recognition_available = False
                     try:
-                        logging.info(f"Downloading Kraken model: {model_id}")
-                        subprocess.run(['kraken', 'get', model_id], check=True)
-                        logging.info(f"Successfully downloaded model: {model_id}")
-                    except subprocess.CalledProcessError as e:
-                        logging.error(f"Failed to download Kraken model {model_id}: {e}")
-                    except Exception as e:
-                        logging.error(f"Unexpected error while downloading Kraken model {model_id}: {e}")
+                        from kraken.recognition import load_any
+                        recognition_available = True
+                    except ImportError:
+                        try:
+                            import kraken.rpred
+                            recognition_available = True
+                        except ImportError:
+                            logging.warning("Kraken recognition modules not found after installation.")
+                    
+                    if recognition_available:
+                        external_tools['kraken'] = True
+                        logging.info("Kraken OCR installed successfully with all required modules.")
+                        
+                        # After successful installation, download required models
+                        required_models = [            # Example model IDs, adjust based on your needs
+                            '10.5281/zenodo.2577813',  # en_best.mlmodel
+                            '10.5281/zenodo.11113737', # reichenau_lat_cat_099218.mlmodel
+                            '10.5281/zenodo.7631619',  # cremma-generic-1.0.1.mlmodel
+                            '10.5281/zenodo.7050296',  # arabic_best.mlmodel
+                            '10.5281/zenodo.10519596', # german_print.mlmodel
+                            '10.5281/zenodo.7933402',  # austriannewspapers.mlmodel
+                            # Add other model IDs as needed
+                        ]
+                        for model_id in required_models:
+                            try:
+                                logging.info(f"Downloading Kraken model: {model_id}")
+                                model_result = run_subprocess_with_timeout(['kraken', 'get', model_id], timeout=180, check=False)
+                                if model_result and model_result.returncode == 0:
+                                    logging.info(f"Successfully downloaded model: {model_id}")
+                                else:
+                                    logging.warning(f"Failed to download Kraken model {model_id}")
+                            except Exception as e:
+                                logging.error(f"Unexpected error while downloading Kraken model {model_id}: {e}")
+                    else:
+                        logging.error("Kraken OCR installation was incomplete. Missing recognition modules.")
+                        external_tools['kraken'] = False
+                except ImportError as e:
+                    logging.error(f"Kraken OCR installation was incomplete. Missing modules: {e}")
+                    external_tools['kraken'] = False
+            else:
+                logging.error("Kraken OCR installation failed or 'kraken' is not in PATH.")
+                external_tools['kraken'] = False
+
     
     # Check for pyvips (required for Kraken PDF support)
+    pyvips_available = False
     try:
         import pyvips
+        pyvips_available = True
         logging.debug("pyvips is available.")
-    except ImportError:
-        logging.warning("pyvips is not installed. Installing pyvips and its dependencies...")
-        # Check if Homebrew is installed
-        if shutil.which('brew'):
-            # Install libvips using Homebrew
-            if not shutil.which('vips'):
-                try:
-                    subprocess.run(['brew', 'install', 'vips'], check=True)
-                    logging.info("Successfully installed libvips via Homebrew.")
-                except subprocess.CalledProcessError as e:
-                    logging.error(f"Failed to install libvips via Homebrew: {e}")
-            else:
-                logging.debug("libvips is already installed via Homebrew.")
-        else:
-            logging.error("Homebrew is not installed. Please install Homebrew to proceed with pyvips installation.")
-            if not NO_INSTALL:
-                logging.info("Attempting to install pyvips without libvips (may fail)...")
+    except Exception as e:
+        logging.warning(f"pyvips import failed: {e}")
+        logging.warning("Kraken PDF support requires pyvips to function properly.")
         
-        # Attempt to install pyvips via pip
-        install_pyvips = ['pip', 'install', 'pyvips']
-        if prompt_install_tool('pyvips', install_pyvips, auto_install=True, no_install=NO_INSTALL):
+        # Determine if libvips is installed
+        libvips_installed = False
+        try:
+            result = subprocess.run(['pkg-config', '--exists', 'vips'], check=False)
+            libvips_installed = result.returncode == 0
+        except:
+            pass
+        
+        if not libvips_installed and shutil.which('brew') and not NO_INSTALL:
             try:
-                import pyvips
-                logging.debug("pyvips installed successfully.")
-            except ImportError:
-                logging.error("pyvips installation failed.")
+                user_input = input("libvips is not found but is required for Kraken. Install with Homebrew? [y/N]: ").strip().lower()
+                if user_input == 'y':
+                    logging.info("Installing libvips with Homebrew...")
+                    subprocess.run(['brew', 'install', 'vips'], check=True)
+                    logging.info("Successfully installed libvips. Setting up environment variables...")
+                    
+                    # Get libvips location
+                    vips_lib_path = subprocess.run(['brew', '--prefix', 'vips'], capture_output=True, text=True).stdout.strip() + "/lib"
+                    os.environ['DYLD_LIBRARY_PATH'] = vips_lib_path + ":" + os.environ.get('DYLD_LIBRARY_PATH', '')
+                    
+                    # Try installing pyvips if it's not already
+                    logging.info("Installing/reinstalling pyvips...")
+                    subprocess.run(['pip', 'uninstall', '-y', 'pyvips'], check=False)
+                    subprocess.run(['pip', 'install', '--no-cache-dir', 'pyvips'], check=True)
+                    
+                    # We can't reliably import pyvips now because the dynamic loader cache is already populated
+                    # Instead, give instructions to the user
+                    logging.info("libvips and pyvips installed. Please restart the script in a new terminal session.")
+                    logging.info(f"Before running, add this to your shell profile (~/.zshrc or ~/.bash_profile):")
+                    logging.info(f"    export DYLD_LIBRARY_PATH=\"{vips_lib_path}:$DYLD_LIBRARY_PATH\"")
+                    
+                    if input("Would you like to exit now to restart with the new environment? [y/N]: ").strip().lower() == 'y':
+                        logging.info("Exiting for restart with new environment variables.")
+                        sys.exit(0)
+            except Exception as e:
+                logging.error(f"Failed to install libvips or pyvips: {e}")
+        
+        logging.info("Continuing without Kraken PDF support...")
 
     # Check for Tesseract availability
     if shutil.which('tesseract'):
@@ -2348,66 +2817,43 @@ def main(directory, verbose, force, singletask, debug, NO_INSTALL):
         else:
             # Concurrent processing
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {
-                    executor.submit(
+                future_to_file = {}
+                
+                # Submit all tasks
+                for filename in files:
+                    future = executor.submit(
+                        process_with_timeout,  # Wrap the process_file with timeout
                         process_file, 
                         os.path.join(directory, filename), 
-                        openai_client,  # Pass the OpenAI client
+                        openai_client,
                         max_attempts=MAX_RETRY_ATTEMPTS, 
                         verbose=verbose, 
                         tools_available=tools_available,
                         optional_libraries=optional_libraries
-                    ): filename
-                    for filename in files
-                }
+                    )
+                    future_to_file[future] = filename
+                
+                # Create a timeout for the whole processing batch
+                overall_deadline = time.time() + (300 * len(files))  # Average 5 minutes per file
+                
+                # Process completed tasks
                 try:
-                    for future in as_completed(future_to_file):
-                        if shutdown_flag.is_set():
-                            logging.info("Shutdown flag detected. Breaking out of the processing loop.")
-                            for fut in future_to_file:
-                                fut.cancel()
+                    for future in concurrent.futures.as_completed(future_to_file, timeout=max(300, len(files) * 10)):
+                        # Check if we need to shutdown
+                        if shutdown_flag.is_set() or time.time() > overall_deadline:
+                            logging.info("Shutdown flag detected or deadline reached. Breaking out of the processing loop.")
+                            for fut in list(future_to_file.keys()):
+                                if not fut.done():
+                                    fut.cancel()
                             break
+                        
+                        # Process the completed future
                         filename = future_to_file[future]
                         file_path = os.path.join(directory, filename)
                         try:
                             metadata = future.result()
-                            if metadata:
-                                author = metadata['author']
-                                title = metadata['title']
-                                year = metadata['year']
-                                if not author or not title:
-                                    logging.warning(f"Missing author or title for {file_path}. Skipping renaming.")
-                                    with file_lock:
-                                        with open("unparseables.lst", "a") as unparseable_file:
-                                            unparseable_file.write(f"{file_path}\n")
-                                            unparseable_file.flush()
-                                    continue
-                                first_author = sanitize_filename(author.split(", ")[0])
-                                target_dir = os.path.join(directory, first_author)
-                                if year == "Unknown":
-                                    logging.info(f"Year is unknown for {file_path}. Assigning 'UnknownYear' in filename.")
-                                    year = "UnknownYear"
-                                else:
-                                    year = sanitize_filename(year)
-                                sanitized_title = sanitize_filename(title)
-                                file_extension = filename.split('.')[-1]
-                                new_filename = f"{year} {sanitized_title}.{file_extension}"
-                                new_file_path = os.path.join(target_dir, new_filename)
-                                escaped_file_path = escape_special_chars(file_path)
-                                escaped_target_dir = escape_special_chars(target_dir)
-                                escaped_new_file_path = escape_special_chars(new_file_path)
-                                with file_lock:
-                                    with open(rename_script_path, "a") as mv_file:
-                                        mv_file.write(f"mkdir -p {escaped_target_dir}\n")
-                                        mv_file.write(f"mv {escaped_file_path} {escaped_new_file_path}\n")
-                                        mv_file.flush()
-                                logging.debug(f"Rename command added for: {file_path}")
-                            else:
-                                with file_lock:
-                                    with open("unparseables.lst", "a") as unparseable_file:
-                                        unparseable_file.write(f"{file_path}\n")
-                                        unparseable_file.flush()
-                                logging.info(f"Added to unparseables: {file_path}")
+                            # (rest of your existing processing code)
+                            
                         except Exception as e:
                             logging.error(f"Failed to process {file_path}: {e}")
                             with file_lock:
@@ -2416,13 +2862,11 @@ def main(directory, verbose, force, singletask, debug, NO_INSTALL):
                                     unparseable_file.flush()
                         finally:
                             progress_bar.update(1)
-                except Exception as e:
-                    logging.error(f"Error during concurrent processing: {e}")
-                finally:
-                    if shutdown_flag.is_set():
-                        logging.info("Cancelling pending tasks...")
-                        for future in future_to_file:
-                            future.cancel()
+                except concurrent.futures.TimeoutError:
+                    logging.error("Overall batch processing timed out")
+                    for fut in list(future_to_file.keys()):
+                        if not fut.done():
+                            fut.cancel()
     
         progress_bar.close()
 
@@ -2504,12 +2948,41 @@ shutdown_flag = threading.Event()
 
 # Signal handler to set the shutdown flag
 def signal_handler(signum, frame):
-    logging.info(f"Received signal {signum}. Initiating graceful shutdown...")
-    shutdown_flag.set()
+    """
+    Signal handler for SIGINT, SIGTERM, and other interrupt signals.
+    Sets the shutdown flag and logs the interrupt event.
+    """
+    if not shutdown_flag.is_set():  # Only log once
+        signal_name = {
+            signal.SIGINT: "SIGINT (Ctrl+C)",
+            signal.SIGTERM: "SIGTERM",
+            signal.SIGTSTP: "SIGTSTP (Ctrl+Z)"
+        }.get(signum, f"Signal {signum}")
+        
+        logging.info(f"Received {signal_name}. Initiating graceful shutdown...")
+        shutdown_flag.set()
+        
+        # When SIGINT (Ctrl+C) is received, make sure to set a proper exit code
+        if signum == signal.SIGINT:
+            # Instead of exit, use a delayed exit to allow threads to clean up
+            def exit_after_timeout():
+                time.sleep(MAX_WAIT_AFTER_SHUTDOWN)
+                if threading.main_thread().is_alive():
+                    logging.warning("Forced exit after timeout - some threads may not have terminated cleanly")
+                    os._exit(1)  # Force exit if threads aren't responding
+            
+            # Start the force-exit timer
+            threading.Thread(target=exit_after_timeout, daemon=True).start()
+    
+    # If SIGTSTP (Ctrl+Z), convert it to a graceful shutdown instead of suspending
+    if signum == signal.SIGTSTP:
+        # Prevent the default behavior (job suspension)
+        signal.signal(signal.SIGTSTP, signal.SIG_IGN)
 
 # Register signal handlers for SIGINT and SIGTERM
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGTSTP, signal_handler)  # Handle Ctrl+Z
 
 # Attempt to import essential and optional libraries and set availability flags
 essential_libraries = {

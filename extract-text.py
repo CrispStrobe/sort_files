@@ -73,7 +73,8 @@ file_lock = threading.Lock()
 shutdown_flag = threading.Event()
 
 # Constants for LLM model
-MODEL_NAME = "cas/spaetzle-v85-7b"  
+#MODEL_NAME = "cas/spaetzle-v85-7b" 
+MODEL_NAME = "cas/llama-3.2-3b-instruct:latest"
 # Can also use "cas/llama-3.1-8b-instruct" or other Ollama models
 
 class timeout:
@@ -2319,17 +2320,185 @@ class DocumentProcessor:
                 counter += 1
         
         return str(output_path)
+    
+    def _process_metadata_for_sorting(self, input_file, text, openai_client, rename_script_path, output_path=None):
+        """
+        Extract and process metadata for sorting/renaming files.
+        
+        Args:
+            input_file: Path to the input file
+            text: Extracted text content
+            openai_client: OpenAI client for Ollama communication
+            rename_script_path: Path to write rename commands
+            output_path: Path to the output text file
+            
+        Returns:
+            dict: Dictionary with result information
+        """
+        result = {
+            'success': False,
+            'metadata': None,
+            'renamed': False,
+            'error': None
+        }
+        
+        try:
+            # Get metadata from Ollama server
+            metadata_content = send_to_ollama_server(text, input_file, openai_client)
+            if not metadata_content:
+                result['error'] = "Failed to get metadata from Ollama server"
+                return result
+                
+            # Parse metadata with improved parser
+            metadata = parse_metadata(metadata_content)
+            if not metadata:
+                result['error'] = "Failed to parse metadata"
+                return result
+                
+            # Get basic metadata fields
+            author = metadata['author']
+            title = metadata['title']
+            year = metadata['year']
+            language = metadata.get('language', 'en')
+            
+            # Validate and fix year
+            year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
+            
+            # Process and validate author name
+            if not author or author.lower() in ["unknown", "unknownauthor", "n a"]:
+                result['error'] = "Missing or invalid author name"
+                return result
+                
+            corrected_author = sort_author_names(author, openai_client)
+            if not corrected_author or corrected_author == "UnknownAuthor":
+                result['error'] = "Failed to format author name correctly"
+                return result
+                
+            # Validate title
+            if not title or title.lower() in ["unknown", "title", ""]:
+                result['error'] = "Missing or invalid title"
+                return result
+                
+            # Create target paths with sanitized names
+            first_author = sanitize_filename(corrected_author)
+            sanitized_title = sanitize_filename(title)
+            
+            # Create target directory path
+            target_dir = os.path.join(os.path.dirname(input_file), first_author)
+            
+            # Create new filename with year and title
+            file_extension = os.path.splitext(input_file)[1].lower()
+            new_filename = f"{year} {sanitized_title}{file_extension}"
+            
+            # Add language code suffix for non-English files if detected
+            if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
+                # Extract just the base extension without dot
+                base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
+                # Replace the file extension with language code + extension
+                new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
+            
+            logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
+            
+            # Add rename command to the script
+            add_rename_command(
+                rename_script_path,
+                source_path=input_file,
+                target_dir=target_dir,
+                new_filename=new_filename,
+                output_dir=os.path.dirname(output_path) if output_path else None
+            )
+            
+            result['success'] = True
+            result['metadata'] = {
+                'author': corrected_author,
+                'title': title,
+                'year': year,
+                'language': language
+            }
+            result['renamed'] = True
+            
+        except Exception as e:
+            result['error'] = str(e)
+            logging.error(f"Error processing metadata: {e}")
+            
+        return result
+
+    # This function would replace part of the _process_single_file method
+    def _handle_sorting(self, input_file, text, openai_client, rename_script_path, output_path, counters):
+        """
+        Handle sorting operations for a single file.
+        
+        Args:
+            input_file: Path to the input file
+            text: Extracted text content
+            openai_client: OpenAI client for Ollama communication
+            rename_script_path: Path to the rename script
+            output_path: Path to the output text file
+            counters: Dictionary of counters
+            
+        Returns:
+            dict: Dictionary with result information
+        """
+        try:
+            # Process metadata for sorting
+            sort_result = _process_metadata_for_sorting(
+                input_file=input_file,
+                text=text,
+                openai_client=openai_client,
+                rename_script_path=rename_script_path,
+                output_path=output_path
+            )
+            
+            if sort_result['success']:
+                counters['sorted'] += 1
+                return {
+                    'success': True,
+                    'metadata': sort_result['metadata']
+                }
+            else:
+                # Log the error
+                error_msg = sort_result.get('error', "Unknown error during sorting")
+                logging.warning(f"Failed to sort file {input_file}: {error_msg}")
+                
+                # Add to unparseables list
+                with file_lock:
+                    with open("unparseables.lst", "a") as unparseable_file:
+                        unparseable_file.write(f"{input_file} - {error_msg}\n")
+                        unparseable_file.flush()
+                        
+                counters['sort_failed'] += 1
+                return {
+                    'success': False,
+                    'error': error_msg
+                }
+                
+        except Exception as e:
+            # Catch any unhandled exceptions
+            error_msg = f"Error sorting file: {str(e)}"
+            logging.error(error_msg)
+            
+            # Add to unparseables list
+            with file_lock:
+                with open("unparseables.lst", "a") as unparseable_file:
+                    unparseable_file.write(f"{input_file} - {error_msg}\n")
+                    unparseable_file.flush()
+                    
+            counters['sort_failed'] += 1
+            return {
+                'success': False,
+                'error': error_msg
+            }
 
     def _process_single_file(self, input_file: str,
-                    output_dir: Optional[str] = None,
-                    method: Optional[str] = None,
-                    password: Optional[str] = None,
-                    extract_tables: bool = False,
-                    noskip: bool = False,
-                    sort: bool = False,
-                    rename_script_path: str = None,
-                    counters: Dict[str, int] = None,
-                    **kwargs) -> Dict[str, Any]:
+                output_dir: Optional[str] = None,
+                method: Optional[str] = None,
+                password: Optional[str] = None,
+                extract_tables: bool = False,
+                noskip: bool = False,
+                sort: bool = False,
+                rename_script_path: str = None,
+                counters: Dict[str, int] = None,
+                **kwargs) -> Dict[str, Any]:
         """
         Process a single document, with optimized skipping logic for sorting
         
@@ -2474,100 +2643,94 @@ class DocumentProcessor:
                         # Get thread-local OpenAI client
                         openai_client = get_openai_client()
                         
-                        # Get metadata from Ollama server
+                        # Get metadata from Ollama server using improved function that handles multiple formats
                         metadata_content = send_to_ollama_server(text, input_file, openai_client)
                         if metadata_content:
+                            # Parse metadata with improved parser supporting multiple formats
                             metadata = parse_metadata(metadata_content)
                             if metadata:
-                                # Process author names
+                                # Process author names with improved function that handles multiple formats
                                 author = metadata['author']
-                                logging.debug(f"extracted author: {author}")
+                                logging.debug(f"Extracted author: {author}")
+                                
+                                # Check if author is a single word, if so, add "Unknown" as firstname
+                                author_parts = author.split()
+                                if len(author_parts) == 1:
+                                    author = f"{author} Unknown"
+                                    logging.info(f"Adding 'Unknown' to single word author: {author_parts[0]} -> {author}")
+                                    metadata['author'] = author
 
                                 corrected_author = sort_author_names(author, openai_client)
-                                logging.debug(f"corrected author: {corrected_author}")
-
+                                logging.debug(f"Corrected author: {corrected_author}")
                                 metadata['author'] = corrected_author
                                 
                                 # Get file details
                                 title = metadata['title']
-                                year = metadata['year']
-                                if not year or year == "Unknown":
-                                    year = "UnknownYear"
-                                    
-                                if not author or not title:
+                                year = metadata.get('year', 'Unknown')
+                                
+                                # Validate and fix year with new helper function
+                                year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
+                                
+                                # Get language if available
+                                language = metadata.get('language', 'en')
+                                
+                                # Validate essential metadata
+                                if not corrected_author or corrected_author == "UnknownAuthor" or not title:
                                     logging.warning(f"Missing author or title for {input_file}. Skipping rename.")
                                     with file_lock:
                                         with open("unparseables.lst", "a") as unparseable_file:
-                                            unparseable_file.write(f"{input_file}\n")
+                                            unparseable_file.write(f"{input_file} - Missing metadata: Author='{corrected_author}', Title='{title}'\n")
                                             unparseable_file.flush()
                                     counters['sort_failed'] += 1
                                 else:
-                                    # Create target paths with full author name
+                                    # Create target paths with sanitized names
                                     first_author = sanitize_filename(corrected_author)
+                                    sanitized_title = sanitize_filename(title)
                                     target_dir = os.path.join(os.path.dirname(input_file), first_author)
                                     file_extension = os.path.splitext(input_file)[1].lower()
-                                    new_filename = f"{year} {sanitize_filename(title)}{file_extension}"
+                                    
+                                    # Create filename with appropriate formatting
+                                    # Handle non-English files with language code
+                                    if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
+                                        # Extract just the base extension without dot
+                                        base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
+                                        # Add language code before extension
+                                        new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
+                                    else:
+                                        new_filename = f"{year} {sanitized_title}{file_extension}"
+                                    
                                     logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
                                     
-                                    # Add rename command
-                                    escaped_source_path = escape_special_chars(input_file)
-                                    escaped_target_dir = escape_special_chars(target_dir)
-                                    escaped_target_path = escape_special_chars(os.path.join(target_dir, new_filename))
+                                    # Add rename command with improved function
+                                    add_rename_command(
+                                        rename_script_path,
+                                        source_path=input_file,
+                                        target_dir=target_dir,
+                                        new_filename=new_filename,
+                                        output_dir=os.path.dirname(output_path) if output_path else None
+                                    )
                                     
-                                    # Add rename command for the file
-                                    with file_lock:
-                                        with open(rename_script_path, "a") as mv_file:
-                                            mv_file.write(f"mkdir -p {escaped_target_dir}\n")
-                                            mv_file.write(f"mv {escaped_source_path} {escaped_target_path}\n")
-                                            
-                                            # Also add command to move the text file if it exists
-                                            if output_path:
-                                                text_extension = ".txt"
-                                                txt_source_path = os.path.splitext(input_file)[0] + text_extension
-                                                if output_dir:
-                                                    # If output is in a different directory
-                                                    txt_source_path = os.path.join(
-                                                        output_dir,
-                                                        os.path.basename(os.path.splitext(input_file)[0]) + text_extension
-                                                    )
-                                                
-                                                txt_target_path = os.path.join(
-                                                    target_dir,
-                                                    f"{year} {sanitize_filename(title)}{text_extension}"
-                                                )
-                                                
-                                                escaped_txt_source = escape_special_chars(txt_source_path)
-                                                escaped_txt_target = escape_special_chars(txt_target_path)
-                                                
-                                                mv_file.write(f"# Also move the text file if it exists\n")
-                                                mv_file.write(f"if [ -f {escaped_txt_source} ]; then\n")
-                                                mv_file.write(f"  mv {escaped_txt_source} {escaped_txt_target}\n")
-                                                mv_file.write(f"fi\n\n")
-                                            
-                                            mv_file.flush()
-                                    
-                                    logging.debug(f"Added rename command for: {input_file}")
                                     result['metadata'] = metadata
                                     counters['sorted'] += 1
                             else:
                                 logging.warning(f"Failed to parse metadata for {input_file}")
                                 with file_lock:
                                     with open("unparseables.lst", "a") as unparseable_file:
-                                        unparseable_file.write(f"{input_file}\n")
+                                        unparseable_file.write(f"{input_file} - Failed to parse metadata format: {metadata_content[:100]}...\n")
                                         unparseable_file.flush()
                                 counters['sort_failed'] += 1
                         else:
                             logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
                             with file_lock:
                                 with open("unparseables.lst", "a") as unparseable_file:
-                                    unparseable_file.write(f"{input_file}\n")
+                                    unparseable_file.write(f"{input_file} - Failed to get metadata from Ollama server\n")
                                     unparseable_file.flush()
                             counters['sort_failed'] += 1
                     except Exception as sort_e:
                         logging.error(f"Error sorting file {input_file}: {sort_e}")
                         with file_lock:
                             with open("unparseables.lst", "a") as unparseable_file:
-                                unparseable_file.write(f"{input_file}\n")
+                                unparseable_file.write(f"{input_file} - Error during sorting: {str(sort_e)}\n")
                                 unparseable_file.flush()
                         counters['sort_failed'] += 1
                 
@@ -2582,12 +2745,16 @@ class DocumentProcessor:
                         logging.error(f"Table extraction failed for {input_file}: {te}")
                         result['tables'] = []
                 
-                # Extract metadata
-                result['metadata'] = self._extract_metadata(input_file)
+                # Extract file metadata
+                result['metadata'].update(self._extract_metadata(input_file))
                     
             else:
                 logging.error(f"Failed to extract text from {input_file}")
                 result['error'] = "No text extracted"
+                with file_lock:
+                    with open("unparseables.lst", "a") as unparseable_file:
+                        unparseable_file.write(f"{input_file} - No text extracted\n")
+                        unparseable_file.flush()
                 counters['failed'] += 1
                 
         except Exception as e:
@@ -2599,7 +2766,7 @@ class DocumentProcessor:
             
             with file_lock:
                 with open("unparseables.lst", "a") as unparseable_file:
-                    unparseable_file.write(f"{input_file}\n")
+                    unparseable_file.write(f"{input_file} - Processing error: {str(e)}\n")
                     unparseable_file.flush()
         
         return result
@@ -2724,66 +2891,108 @@ def sanitize_filename(name):
     
     return name.strip().replace('/', '')
 
-def parse_metadata(content, verbose=False):
-    """
-    Parse the metadata content returned by the Ollama server.
-    
-    Returns:
-        dict or None: Dictionary containing author, year, title, and language
-    """
-    title_match = re.search(r'<TITLE>(.*?)</TITLE>', content, re.DOTALL)
-    year_match = re.search(r'<YEAR>(\d{4})</YEAR>', content, re.DOTALL)
-    author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content, re.DOTALL)
-    language_match = re.search(r'<LANGUAGE>(.*?)</LANGUAGE>', content, re.DOTALL)
-    
-    # If TITLE tag is incomplete, try to match it differently
-    if not title_match:
-        title_match = re.search(r'TITLE>(.*?)</TITLE>', content, re.DOTALL)
-    
-    # Extract values from matches
-    title = title_match.group(1).strip() if title_match else None
-    author = author_match.group(1).strip() if author_match else None
-    year = year_match.group(1).strip() if year_match else "Unknown"
-    language = language_match.group(1).strip().lower() if language_match else "en"
-    
-    # Validate extracted data
-    if not title_match:
-        logging.warning(f"No match for title in {content}.")
-        return None
-    if not author_match:
-        logging.warning(f"No match for author in {content}.")
-        return None
-    
-    # Sanitize filenames
-    title = sanitize_filename(title) if title else "unknown"
-    author = sanitize_filename(author) if author else "unknown"
-    year = sanitize_filename(year)
-    language = sanitize_filename(language)
-    
-    # Check for placeholder values
-    if any(placeholder in (title.lower(), author.lower(), year.lower(), language.lower()) 
-           for placeholder in ["unknown", "UnknownAuthor", "n a", ""]):
-        logging.warning("Warning: Found 'unknown', 'n a', or empty strings in metadata.")
-        return None
-        
-    return {'author': author, 'year': year, 'title': title, 'language': language}
 
 def clean_author_name(author_name):
-    """Remove titles and punctuations from the author name."""
-    author_name = re.sub(r'\bDr\.?\b', '', author_name, flags=re.IGNORECASE)
-    author_name = re.sub(r'\s*,\s*', ' ', author_name).strip()
+    """
+    Clean author name by removing titles, extra spaces, and punctuation.
+    """
+    # Remove common titles
+    author_name = re.sub(r'\b(Dr|Prof|Mr|Mrs|Ms|Rev|Sir)\.?\s+', '', author_name, flags=re.IGNORECASE)
+    
+    # Remove XML entities
+    author_name = re.sub(r'&[a-zA-Z]+;', ' ', author_name)
+    
+    # Remove special characters but keep diacritics for non-English names
+    author_name = re.sub(r'[^\w\s.\'-áéíóúàèìòùäëïöüÄËÏÖÜâêîôûÂÊÎÔÛñÑçÇ]', ' ', author_name, flags=re.UNICODE)
+    
+    # Clean up extra spaces
+    author_name = re.sub(r'\s+', ' ', author_name).strip()
+    
     return author_name
 
 def valid_author_name(author_name):
-    """Check if the author name is valid"""
+    """
+    Check if the author name is valid.
+    Flexible validation to handle various name formats.
+    """
+    # Quick sanity check for empty input
+    if not author_name or len(author_name.strip()) < 3:
+        return False
+        
+    # Split into parts
     parts = author_name.strip().split()
-    if len(parts) <= 1:
+    
+    # Name should have at least two parts
+    if len(parts) < 2:
         return False
-    if not re.match(r'^[\w\s.\'-]+$', author_name, re.UNICODE):
+        
+    # Check for placeholder values
+    lower_name = author_name.lower()
+    if "unknown" in lower_name and len(parts) == 2 and parts[1].lower() == "unknown":
+        # Special case: Allow "Lastname Unknown" as a valid format
+        return True
+        
+    if any(placeholder in lower_name for placeholder in 
+           ["unknownauthor", "lastname", "surname", "firstname", "author", "n a"]):
         return False
-    if "lastname" in author_name.lower() or "surname" in author_name.lower():
+        
+    # Check for reasonable character content
+    # Allow letters, spaces, periods, hyphens, apostrophes and accented characters
+    if not re.match(r'^[\w\s.\'-áéíóúàèìòùäëïöüÄËÏÖÜâêîôûÂÊÎÔÛñÑçÇ]+$', author_name, re.UNICODE):
         return False
+        
+    # Each part should be reasonably sized
+    if any(len(part) < 1 or len(part) > 20 for part in parts):
+        return False
+        
     return True
+
+def validate_and_fix_year(year, filename=None, text_sample=None):
+    """
+    Validate and fix the detected year.
+    
+    Args:
+        year: The year to validate
+        filename: Optional filename to extract year from if not valid
+        text_sample: Optional text sample to look for year in if not in filename
+        
+    Returns:
+        str: A valid year or "UnknownYear"
+    """
+    current_year = datetime.now().year
+    
+    # If year is valid (4 digits between 1500 and current year + 1)
+    if year and re.match(r'^\d{4}$', year) and 1500 <= int(year) <= current_year + 1:
+        return year
+        
+    # Try to extract from filename if provided
+    if filename:
+        filename_year = extract_year_from_filename(filename)
+        if filename_year:
+            return filename_year
+            
+    # Try to extract from text if provided
+    if text_sample:
+        # Look for copyright pattern
+        copyright_match = re.search(r'copyright\s+©?\s*(\d{4})', text_sample, re.IGNORECASE)
+        if copyright_match:
+            return copyright_match.group(1)
+            
+        # Look for publication pattern
+        pub_match = re.search(r'published\s+in\s+(\d{4})', text_sample, re.IGNORECASE)
+        if pub_match:
+            return pub_match.group(1)
+            
+        # Look for any 4-digit year in a reasonable range
+        year_matches = re.findall(r'\b(1[5-9]\d\d|20[0-2]\d)\b', text_sample)
+        if year_matches:
+            # Take the most recent year that's not in the future
+            valid_years = [y for y in year_matches if int(y) <= current_year]
+            if valid_years:
+                return max(valid_years)
+    
+    # Default if no valid year found
+    return "UnknownYear"
 
 def execute_rename_commands(script_path):
     """Execute the generated rename commands script"""
@@ -2802,6 +3011,126 @@ def execute_rename_commands(script_path):
     except Exception as e:
         logging.error(f"Unexpected error during rename command execution: {e}")
 
+
+def parse_metadata(content, verbose=False):
+    """
+    Parse metadata content returned by the Ollama server supporting multiple formats.
+    Properly handles author names with commas.
+    
+    Returns:
+        dict or None: Dictionary containing author, year, title, and language
+    """
+    # Remove XML declarations which might interfere with parsing
+    content = re.sub(r'<\?xml[^>]+\?>', '', content)
+    
+    # Fix common tag issues
+    content = content.replace("<TITLE", "<TITLE>").replace("<AUTHOR", "<AUTHOR>")
+    content = content.replace("<YEAR", "<YEAR>").replace("<LANGUAGE", "<LANGUAGE>")
+    
+    # Try multiple tag formats for each field
+    title_patterns = [
+        r'<TITLE>(.*?)</TITLE>',
+        r'<Title>(.*?)</Title>',
+        r'<title>(.*?)</title>',
+        r'"(.*?)"'  # For cases where title is just in quotes
+    ]
+    
+    year_patterns = [
+        r'<YEAR>(\d{4})</YEAR>',
+        r'<Year>(\d{4})</Year>',
+        r'<year>(\d{4})</year>'
+    ]
+    
+    author_patterns = [
+        r'<AUTHOR>(.*?)</AUTHOR>',
+        r'<Author>(.*?)</Author>',
+        r'<author>(.*?)</author>'
+    ]
+    
+    language_patterns = [
+        r'<LANGUAGE>(.*?)</LANGUAGE>',
+        r'<Language>(.*?)</Language>',
+        r'<language>(.*?)</language>'
+    ]
+    
+    # Try to extract title
+    title = None
+    for pattern in title_patterns:
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            title = match.group(1).strip()
+            if title:
+                break
+    
+    # Try to extract year
+    year = "Unknown"
+    for pattern in year_patterns:
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            year = match.group(1).strip()
+            if year:
+                break
+    
+    # Try to extract author
+    author = None
+    for pattern in author_patterns:
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            author = match.group(1).strip()
+            if author:
+                break
+    
+    # Try to extract language
+    language = "en"
+    for pattern in language_patterns:
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            language = match.group(1).strip().lower()
+            if language:
+                break
+    
+    # Don't split on commas in author names - they're likely "Lastname, Firstname" format
+    # Instead, handle multiple authors separated by semicolons
+    if author and ';' in author:
+        # Split on semicolons and keep only the first author
+        author = author.split(';')[0].strip()
+    
+    # Further clean author name
+    if author:
+        # Remove XML entities
+        author = re.sub(r'&[a-zA-Z]+;', ' ', author)
+        # Remove placeholder text
+        author = re.sub(r'\b(Lastname|Firstname|Surname)\b', '', author, flags=re.IGNORECASE)
+        author = re.sub(r'\s+', ' ', author).strip()
+    
+    # Check if author is a template/placeholder
+    if author and author.lower() in ["lastname firstname", "surname firstname"]:
+        author = None
+    
+    # Validate extracted data
+    if not title:
+        logging.warning(f"No match for title in content")
+        return None
+    if not author:
+        logging.warning(f"No match for author in content")
+        return None
+    
+    # Sanitize filenames
+    title = sanitize_filename(title) if title else "unknown"
+    author = sanitize_filename(author) if author else "unknown"
+    year = sanitize_filename(year)
+    language = sanitize_filename(language)
+    
+    # Check for placeholder values
+    if any(placeholder in (title.lower(), author.lower()) 
+           for placeholder in ["unknown", "unknownauthor", "n a", ""]):
+        logging.warning("Warning: Found 'unknown', 'n a', or empty strings in metadata.")
+        return None
+        
+    return {'author': author, 'year': year, 'title': title, 'language': language}
+
+
+
 def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose=False):
     """
     Query the Ollama server to extract author, year, title, and language with exponential backoff.
@@ -2811,40 +3140,62 @@ def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose
     """
     base_retry_wait = 2  # Base wait time in seconds
     attempt = 1
-    while attempt <= max_attempts and not shutdown_flag.is_set():
-        logging.debug(f"Consulting Ollama server on file: {filename} (Attempt: {attempt})")
-        base_filename = os.path.splitext(os.path.basename(filename))[0]
-        prompt = (
-            f"Extract the author name (lastname surname) of the first author (ignore other authors), year of publication, title, and language from the following text, considering the filename '{base_filename}' which may contain clues. "
-            f"I need the output **only** in the following format with no additional text or explanations: \n"
-            f"<TITLE>The publication title</TITLE> \n<YEAR>2023</YEAR> \n<AUTHOR>Lastname Surname</AUTHOR> \n<LANGUAGE>en</LANGUAGE> \n\n"
-            f"Here is the extracted text:\n{text[:3000]}"  # Limit text to avoid token limits
+    
+    # Prepare different prompt templates to try if earlier ones fail
+    prompt_templates = [
+        # First attempt - simple structured format
+        (
+            f"Extract the full author name (Lastname Surname) of the main author, "
+            f"year of publication, title, and language from the following text, considering the filename '{os.path.basename(filename)}' "
+            f"which may contain clues. I need the output **only** in the following format with no additional text or explanations: \n"
+            f"<TITLE>The publication title</TITLE>\n<YEAR>2023</YEAR>\n<AUTHOR>Lastname Surname</AUTHOR>\n<LANGUAGE>en</LANGUAGE>\n\n"
+        ),
+        # Second attempt - emphasize exact format
+        (
+            f"I need to extract metadata from a document. Please give me ONLY these four tags with the information, and nothing else:\n"
+            f"<TITLE>The exact title</TITLE>\n<YEAR>The publication year (4 digits)</YEAR>\n<AUTHOR>The main author's name (LastName FirstName)</AUTHOR>\n<LANGUAGE>The language code</LANGUAGE>\n\n"
+            f"Document filename: {os.path.basename(filename)}\n"
+        ),
+        # Third attempt - even more explicit
+        (
+            f"You are a metadata extraction tool. Extract these fields from the text:\n"
+            f"1. TITLE (the full publication title)\n"
+            f"2. YEAR (the 4-digit publication year, use 'Unknown' if not found)\n"
+            f"3. AUTHOR (the main author's last name and first name)\n"
+            f"4. LANGUAGE (the 2-letter language code, e.g., 'en', 'de', 'fr')\n\n"
+            f"Format your response EXACTLY like this with no other text:\n"
+            f"<TITLE>The title</TITLE>\n<YEAR>2023</YEAR>\n<AUTHOR>Smith John</AUTHOR>\n<LANGUAGE>en</LANGUAGE>\n\n"
         )
+    ]
+    
+    # Try different prompt templates if we encounter format issues
+    while attempt <= max_attempts and not shutdown_flag.is_set():
+        # Choose prompt template based on attempt number
+        template_index = min(attempt - 1, len(prompt_templates) - 1)
+        prompt_template = prompt_templates[template_index]
+        
+        logging.debug(f"Consulting Ollama server on file: {filename} (Attempt: {attempt}, Template: {template_index + 1})")
+        
+        # Build the final prompt with text sample
+        prompt = prompt_template + f"Here is the document text:\n{text[:3000]}"  # Limit text to avoid token limits
         messages = [{"role": "user", "content": prompt}]
         
         with ollama_semaphore:
             try:
                 response = openai_client.chat.completions.create(
                     model=MODEL_NAME,
-                    temperature=0.7,
+                    temperature=0.5,  # Reduced temperature for more consistent formatting
                     max_tokens=250,
                     messages=messages,
                     timeout=120  # 2 minute timeout
                 )
                 
                 output = response.choices[0].message.content.strip()
-                if verbose:
-                    logging.debug(f"Metadata content received from server: {output}")
-                    
-                # Validation 
-                title = re.search(r'TITLE>(.*?)</TITLE>', output, re.DOTALL)
-                year = re.search(r'<YEAR>(\d{4})</YEAR>', output, re.DOTALL)
-                author = re.search(r'<AUTHOR>(.*?)</AUTHOR>', output, re.DOTALL)
-                language = re.search(r'<LANGUAGE>(.*?)</LANGUAGE>', output, re.DOTALL)
+                logging.debug(f"Metadata content received from server: {output}")
                 
-                if title and year and author and language:
-                    if verbose:
-                        logging.debug(f"The output contains all required fields")
+                # Use the new more flexible parser
+                metadata = parse_metadata(output, verbose=verbose)
+                if metadata:
                     return output
                 else:
                     logging.warning(f"Unexpected response format from Ollama server: {output}")
@@ -2919,11 +3270,171 @@ def initialize_rename_scripts(rename_script_path):
     }
 
 def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False):
-    """Format author names into 'Lastname Firstname' format using LLM with backoff"""
+    """
+    Format author names into 'Lastname Firstname' format using LLM with backoff.
+    Properly handles author names with commas.
+    """
+    if not author_names or author_names.strip() in ["Unknown", "UnknownAuthor", "n a", ""]:
+        return "UnknownAuthor"
+    
+    # First clean the input and handle commas properly
+    author_names = author_names.replace('</AUTHOR>', '').replace('<AUTHOR>', '')
+    
+    # Check for comma format (likely "Lastname, Firstname")
+    if ',' in author_names:
+        # This is already likely in "Lastname, Firstname" format
+        # Just remove the comma to get "Lastname Firstname"
+        formatted_name = author_names.replace(',', ' ').strip()
+        # Clean up extra spaces
+        formatted_name = re.sub(r'\s+', ' ', formatted_name)
+        
+        # Validate the name has at least two parts
+        if ' ' in formatted_name:
+            logging.debug(f"Processed comma-formatted name: {author_names} -> {formatted_name}")
+            return formatted_name
+    
+    # Remove placeholder text that might appear in responses
+    formatted_author_names = re.sub(r'\b(Lastname|Firstname|Surname)\b', '', author_names, flags=re.IGNORECASE)
+    formatted_author_names = re.sub(r'\s+', ' ', formatted_author_names).strip()
+    
+    # Handle multiple authors separated by different delimiters (but not commas)
+    if any(delimiter in formatted_author_names for delimiter in [';', '&', ' and ']):
+        # Split on these delimiters and keep only the first author
+        for delimiter in [';', '&', ' and ']:
+            if delimiter in formatted_author_names:
+                formatted_author_names = formatted_author_names.split(delimiter)[0].strip()
+                break
+    
+    # If after cleaning we have nothing, return unknown
+    if not formatted_author_names or len(formatted_author_names.strip()) < 3:
+        return "UnknownAuthor"
+    
+    # Check if name is already in "Lastname Firstname" format after basic processing
+    parts = formatted_author_names.split()
+    if len(parts) >= 2:
+        # We have at least two parts, might be good enough
+        return formatted_author_names
+    
+    # It's a single word, we need to consult the LLM
+    # Use LLM to get the correct format with retries
     base_retry_wait = 2  # Base wait time in seconds
     for attempt in range(1, max_attempts + 1):
         if verbose:
-            logging.debug(f"Attempt {attempt} to sort author names: {author_names}")
+            logging.debug(f"Attempt {attempt} to sort author name: {formatted_author_names}")
+        
+        # Prepare different prompt templates to try if earlier ones fail
+        if attempt == 1:
+            prompt = (
+                f"You will be given an author name that you must put into the format 'Lastname Firstname'. "
+                f"If it appears to be just a last name without a first name, return it as is. "
+                f"Examples:\n"
+                f"- 'Michael Mustermann' → 'Mustermann Michael'\n"
+                f"- 'Mustermann Michael' → 'Mustermann Michael' (already correct)\n"
+                f"- 'Jean-Paul Sartre' → 'Sartre Jean-Paul'\n"
+                f"- 'van Gogh Vincent' → 'van Gogh Vincent' (already correct)\n"
+                f"- 'Butz' → 'Butz' (single name, return as is)\n"
+                f"Respond ONLY with: <AUTHOR>Lastname Firstname</AUTHOR> or just <AUTHOR>Lastname</AUTHOR> for single names.\n\n"
+                f"Author name: {formatted_author_names}"
+            )
+        else:
+            # Try a different approach on subsequent attempts
+            prompt = (
+                f"I need the author name '{formatted_author_names}' formatted as 'Lastname Firstname(s)'. "
+                f"If it's just a single name (like a last name), return it as is without adding anything. "
+                f"Don't add any explanation, just return the correctly formatted name in this exact format: "
+                f"<AUTHOR>Lastname Firstname</AUTHOR> or <AUTHOR>Lastname</AUTHOR> for single names."
+            )
+            
+        messages = [{"role": "user", "content": prompt}]
+        
+        # Use the semaphore to limit concurrent requests
+        with ollama_semaphore:
+            try:
+                response = openai_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    temperature=0.3,  # Lower temperature for more consistent formatting
+                    max_tokens=100,  # Reduced token count for efficiency
+                    messages=messages
+                )
+                
+                reformatted_name = response.choices[0].message.content.strip()
+                
+                # Check for tag issues and fix them
+                if "<AUTHOR>" not in reformatted_name:
+                    reformatted_name = f"<AUTHOR>{reformatted_name}</AUTHOR>"
+                if "</AUTHOR>" not in reformatted_name and not reformatted_name.endswith("</AUTHOR>"):
+                    reformatted_name = reformatted_name.replace("<AUTHOR>", "<AUTHOR>") + "</AUTHOR>"
+                
+                name_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name)
+                if name_match:
+                    ordered_name = name_match.group(1).strip()
+                    # Final cleanup - remove any placeholder text that might appear
+                    ordered_name = re.sub(r'\b(Lastname|Firstname|Surname)\b', '', ordered_name, flags=re.IGNORECASE)
+                    ordered_name = clean_author_name(ordered_name)
+                    logging.debug(f"Ordered name after cleaning: '{ordered_name}'")
+                    
+                    # Return it even if it's a single word - we won't add "Unknown"
+                    if ordered_name and len(ordered_name) >= 2:
+                        return ordered_name
+                else:
+                    # Try to extract the name without tags if tags are malformed
+                    cleaned_response = reformatted_name.replace("</AUTHOR>", "").replace("<AUTHOR>", "").strip()
+                    if cleaned_response and cleaned_response not in ['Lastname Firstname', 'Unknown']:
+                        ordered_name = clean_author_name(cleaned_response)
+                        if ordered_name and len(ordered_name) >= 2:
+                            return ordered_name
+                            
+                    logging.warning(f"Failed to extract a valid name from: '{reformatted_name}', retrying...")
+                
+            except Exception as e:
+                if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
+                    wait_time = base_retry_wait * (2 ** (attempt - 1))
+                    logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
+                else:
+                    logging.error(f"Error querying Ollama server for author names: {e}")
+                    wait_time = base_retry_wait * (1.5 ** (attempt - 1))
+                    logging.info(f"Retrying in {wait_time:.2f} seconds...")
+                
+                if attempt < max_attempts:
+                    time.sleep(wait_time)
+                    continue
+                
+                # Last resort - just return the original name, even if it's a single word
+                return formatted_author_names
+        
+        # Wait a little between attempts even if no error occurred
+        if attempt < max_attempts:
+            time.sleep(1)  # Small pause between attempts
+                
+    logging.error(f"Maximum retry attempts reached for sorting author name: {formatted_author_names}")
+    
+    # Last resort - just return the original name
+    return formatted_author_names
+
+def extract_year_from_filename(filename):
+    """
+    Try to extract a year (4 digits between 1500-2030) from a filename.
+    
+    Args:
+        filename: The filename to check
+        
+    Returns:
+        str: The year if found, None otherwise
+    """
+    # Look for a 4-digit number within the reasonable range for publication years
+    matches = re.findall(r'\b(1[5-9]\d\d|20[0-2]\d)\b', filename)
+    
+    if matches:
+        # Return the first reasonable match
+        return matches[0]
+    
+    return None
+
+def sort_author_names_old(author_names, openai_client, max_attempts=5, verbose=False):
+    """Format author names into 'Lastname Firstname' format using LLM with backoff"""
+    base_retry_wait = 2  # Base wait time in seconds
+    for attempt in range(1, max_attempts + 1):
+        logging.debug(f"Attempt {attempt} to sort author names: {author_names}")
         
         formatted_author_names = author_names.replace('&', ',')
         prompt = (

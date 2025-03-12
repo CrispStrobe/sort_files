@@ -51,20 +51,12 @@ from datetime import datetime
 from types import MappingProxyType
 import time
 
-
-# Import OpenAI client for Ollama
-try:
-    from openai import OpenAI
-except ImportError:
-    print("OpenAI client library is not installed. Please install it using 'pip install openai'.")
-    print("Required for --sort functionality")
-
-
-# Thread-local storage for OpenAI clients
+# Thread-local storage for LLM clients
 thread_local = threading.local()
 
 # Limit concurrent connections to Ollama - prevents overwhelming the server
 ollama_semaphore = threading.Semaphore(2)  # Allow only 2 concurrent connections
+llm_semaphore = threading.Semaphore(2)
 
 # Global lock for thread-safe file operations
 file_lock = threading.Lock()
@@ -76,6 +68,14 @@ shutdown_flag = threading.Event()
 #MODEL_NAME = "cas/spaetzle-v85-7b" 
 MODEL_NAME = "cas/llama-3.2-3b-instruct:latest"
 # Can also use "cas/llama-3.1-8b-instruct" or other Ollama models
+
+
+# Import OpenAI client for Ollama
+try:
+    from openai import OpenAI
+except ImportError:
+    print("OpenAI client library is not installed. Please install it using 'pip install openai'.")
+    print("Required for --sort functionality")
 
 class timeout:
     """Context manager for timeout"""
@@ -108,7 +108,627 @@ class ProgressProxy:
             self.current_engine = engine
             self.progress_bar.set_description(f"Extracting text [{engine}]")
         self.progress_bar.update(n)
+
+
+class LLMProvider:
+    """Base class for LLM providers"""
+    
+    def __init__(self, model_name: str, api_key: Optional[str] = None):
+        self.model_name = model_name
+        self.api_key = api_key
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """
+        Send chat completion request to the LLM provider
         
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Temperature for generation
+            max_tokens: Maximum tokens to generate
+            timeout: Timeout in seconds
+            
+        Returns:
+            Dict with response content
+        """
+        raise NotImplementedError("Subclasses must implement this method")
+
+class OpenAIProvider(LLMProvider):
+    """OpenAI API provider"""
+    
+    def __init__(self, model_name: str = "gpt-3.5-turbo", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OpenAI API key required. Either pass as api_key or set OPENAI_API_KEY environment variable")
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize OpenAI client"""
+        try:
+            from openai import OpenAI
+            if not hasattr(thread_local, "openai_client"):
+                thread_local.openai_client = OpenAI(api_key=self.api_key)
+            return thread_local.openai_client
+        except ImportError:
+            raise ImportError("OpenAI client library is required. Install with 'pip install openai'")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to OpenAI"""
+        client = self._init_client()
+        
+        with llm_semaphore:
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout
+                )
+                
+                # Convert response to a standard format
+                return {
+                    "id": getattr(response, "id", "unknown"),
+                    "content": response.choices[0].message.content.strip(),
+                    "finish_reason": response.choices[0].finish_reason,
+                    "model": self.model_name
+                }
+            except Exception as e:
+                logging.error(f"OpenAI request failed: {str(e)}")
+                raise
+
+class HuggingFaceProvider(LLMProvider):
+    """HuggingFace Inference API provider"""
+    
+    def __init__(self, model_name: str = "mistralai/Mistral-7B-Instruct-v0.3", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("HF_API_KEY")
+        # HF can work without API key for some models
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to HuggingFace Inference API"""
+        try:
+            from huggingface_hub import InferenceClient
+            
+            # Format messages into HF-compatible prompt
+            prompt = self._format_messages_for_hf(messages)
+            
+            # Initialize client with or without token
+            client = InferenceClient(token=self.api_key) if self.api_key else InferenceClient()
+            
+            with llm_semaphore:
+                response = client.text_generation(
+                    prompt,
+                    model=self.model_name,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=0.95,
+                    repetition_penalty=1.1,
+                    do_sample=True,
+                    timeout=timeout
+                )
+                
+                return {
+                    "id": "hf-inference",
+                    "content": str(response).strip(),
+                    "finish_reason": "stop",
+                    "model": self.model_name
+                }
+                
+        except Exception as e:
+            logging.error(f"HuggingFace inference error: {str(e)}")
+            raise
+    
+    def _format_messages_for_hf(self, messages: List[Dict[str, str]]) -> str:
+        """Format chat messages for HuggingFace text generation"""
+        formatted_prompt = ""
+        
+        # Add system message if present
+        system_msgs = [msg for msg in messages if msg["role"] == "system"]
+        if system_msgs:
+            formatted_prompt = f"<s>[INST] {system_msgs[0]['content']} [/INST]</s>\n\n"
+        
+        # Add user/assistant messages
+        for msg in [m for m in messages if m["role"] != "system"]:
+            if msg["role"] == "user":
+                formatted_prompt += f"<s>[INST] {msg['content']} [/INST]"
+            elif msg["role"] == "assistant":
+                formatted_prompt += f" {msg['content']}</s>\n"
+        
+        # Handle last message if it's from user
+        if messages[-1]["role"] == "user":
+            formatted_prompt += "</s>"
+            
+        return formatted_prompt
+
+class CohereProvider(LLMProvider):
+    """Cohere API provider"""
+    
+    def __init__(self, model_name: str = "command-r-plus", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("COHERE_API_KEY")
+        if not self.api_key:
+            raise ValueError("Cohere API key required. Either pass as api_key or set COHERE_API_KEY environment variable")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to Cohere"""
+        try:
+            import cohere
+            
+            with llm_semaphore:
+                try:
+                    # Try ClientV2 first
+                    client = cohere.ClientV2(self.api_key)
+                    cohere_messages = self._format_messages_for_cohere(messages)
+                    
+                    response = client.chat(
+                        model=self.model_name,
+                        messages=cohere_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                    
+                    return {
+                        "id": "cohere-v2",
+                        "content": response.message.content[0].text,
+                        "finish_reason": "stop",
+                        "model": self.model_name
+                    }
+                    
+                except Exception as e:
+                    logging.warning(f"Cohere V2 failed, trying V1: {e}")
+                    
+                    # Fallback to V1
+                    client = cohere.Client(self.api_key)
+                    # Get the last user message
+                    last_user_msg = next((msg["content"] for msg in reversed(messages) 
+                                        if msg["role"] == "user"), "")
+                    
+                    response = client.chat(
+                        message=last_user_msg,
+                        model=self.model_name,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                    
+                    return {
+                        "id": "cohere-v1",
+                        "content": response.text,
+                        "finish_reason": "stop",
+                        "model": self.model_name
+                    }
+                    
+        except ImportError:
+            raise ImportError("Cohere client library is required. Install with 'pip install cohere'")
+        except Exception as e:
+            logging.error(f"Cohere request failed: {str(e)}")
+            raise
+    
+    def _format_messages_for_cohere(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Format messages for Cohere API"""
+        cohere_messages = []
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                cohere_messages.append({"role": "SYSTEM", "content": msg["content"]})
+            elif msg["role"] == "user":
+                cohere_messages.append({"role": "USER", "content": msg["content"]})
+            elif msg["role"] == "assistant":
+                cohere_messages.append({"role": "CHATBOT", "content": msg["content"]})
+                
+        return cohere_messages
+
+class GLHFProvider(LLMProvider):
+    """GLHF API provider (uses OpenAI-compatible API)"""
+    
+    def __init__(self, model_name: str = "mistralai/Mistral-7B-Instruct-v0.3", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("GLHF_API_KEY")
+        if not self.api_key:
+            raise ValueError("GLHF API key required. Either pass as api_key or set GLHF_API_KEY environment variable")
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize GLHF client (using OpenAI client with custom base URL)"""
+        try:
+            from openai import OpenAI
+            if not hasattr(thread_local, "glhf_client"):
+                thread_local.glhf_client = OpenAI(
+                    api_key=self.api_key,
+                    base_url="https://glhf.chat/api/openai/v1"
+                )
+            return thread_local.glhf_client
+        except ImportError:
+            raise ImportError("OpenAI client library is required for GLHF. Install with 'pip install openai'")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to GLHF"""
+        client = self._init_client()
+        
+        # Format model id for GLHF
+        model_id = f"hf:{self.model_name}" if not self.model_name.startswith("hf:") else self.model_name
+        
+        with llm_semaphore:
+            try:
+                # GLHF works best with streaming
+                response_chunks = []
+                
+                completion = client.chat.completions.create(
+                    stream=True,
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout
+                )
+                
+                for chunk in completion:
+                    if chunk.choices[0].delta.content is not None:
+                        response_chunks.append(chunk.choices[0].delta.content)
+                        
+                full_response = "".join(response_chunks)
+                
+                return {
+                    "id": "glhf",
+                    "content": full_response,
+                    "finish_reason": "stop",
+                    "model": self.model_name
+                }
+                
+            except Exception as e:
+                logging.error(f"GLHF request failed: {str(e)}")
+                raise
+
+class OllamaProvider(LLMProvider):
+    """Ollama LLM provider for local LLMs"""
+    
+    def __init__(self, model_name: str = "cas/llama-3.2-3b-instruct:latest", 
+                base_url: str = "http://localhost:11434/v1/"):
+        super().__init__(model_name)
+        self.base_url = base_url
+        # Use OpenAI client with Ollama
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize OpenAI client for Ollama"""
+        try:
+            from openai import OpenAI
+            if not hasattr(thread_local, "ollama_client"):
+                thread_local.ollama_client = OpenAI(
+                    base_url=self.base_url,
+                    api_key="ollama"  # Placeholder value for Ollama
+                )
+            return thread_local.ollama_client
+        except ImportError:
+            raise ImportError("OpenAI client library is required. Install with 'pip install openai'")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to Ollama"""
+        client = self._init_client()
+        
+        with llm_semaphore:
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    timeout=timeout
+                )
+                
+                # Convert response to a standard format
+                return {
+                    "id": getattr(response, "id", "unknown"),
+                    "content": response.choices[0].message.content.strip(),
+                    "finish_reason": response.choices[0].finish_reason,
+                    "model": self.model_name
+                }
+            except Exception as e:
+                logging.error(f"Ollama request failed: {str(e)}")
+                raise
+
+
+class GroqProvider(LLMProvider):
+    """Groq LLM provider for cloud LLMs"""
+    
+    def __init__(self, model_name: str = "llama3-70b-8192", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("Groq API key required. Either pass as api_key or set GROQ_API_KEY environment variable")
+        self._init_client()
+    
+    def _init_client(self):
+        """Initialize Groq client"""
+        try:
+            from groq import Groq
+            if not hasattr(thread_local, "groq_client"):
+                thread_local.groq_client = Groq(api_key=self.api_key)
+            return thread_local.groq_client
+        except ImportError:
+            raise ImportError("Groq client library is required. Install with 'pip install groq'")
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to Groq"""
+        client = self._init_client()
+        
+        with llm_semaphore:
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout
+                )
+                
+                # Convert response to a standard format
+                return {
+                    "id": getattr(response, "id", "unknown"),
+                    "content": response.choices[0].message.content.strip(),
+                    "finish_reason": response.choices[0].finish_reason,
+                    "model": self.model_name
+                }
+            except Exception as e:
+                logging.error(f"Groq request failed: {str(e)}")
+                raise
+
+
+class PoeProvider(LLMProvider):
+    """Poe.com LLM provider"""
+    
+    def __init__(self, model_name: str = "claude-3-opus", api_key: Optional[str] = None):
+        super().__init__(model_name, api_key)
+        self.api_key = api_key or os.environ.get("POE_API_KEY")
+        if not self.api_key:
+            raise ValueError("Poe API key required. Either pass as api_key or set POE_API_KEY environment variable")
+        self.api_url = "https://api.poe.com/api/chat"
+    
+    def chat_completion(self, messages: List[Dict[str, str]], 
+                       temperature: float = 0.7, 
+                       max_tokens: int = 500,
+                       timeout: int = 120) -> Dict[str, Any]:
+        """Send chat completion request to Poe.com"""
+        
+        # Format messages for Poe API
+        formatted_messages = []
+        for msg in messages:
+            if msg['role'] == 'system':
+                # Poe doesn't support system messages directly,
+                # prepend to first user message instead
+                continue
+            formatted_messages.append({
+                "role": msg['role'],
+                "content": msg['content']
+            })
+        
+        # Add system message to the first user message if present
+        system_messages = [msg for msg in messages if msg['role'] == 'system']
+        if system_messages and formatted_messages:
+            for user_msg in formatted_messages:
+                if user_msg['role'] == 'user':
+                    user_msg['content'] = f"[System Instructions: {system_messages[0]['content']}]\n\n{user_msg['content']}"
+                    break
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model_name,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        with llm_semaphore:
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                
+                # Extract and return content in a standard format
+                return {
+                    "id": response_data.get("id", "unknown"),
+                    "content": response_data.get("choices", [{"message": {"content": ""}}])[0]["message"]["content"].strip(),
+                    "finish_reason": response_data.get("choices", [{"finish_reason": "unknown"}])[0]["finish_reason"],
+                    "model": self.model_name
+                }
+            except requests.RequestException as e:
+                logging.error(f"Poe request failed: {str(e)}")
+                raise
+
+
+def get_llm_provider(provider_type: str = "ollama", 
+                    model_name: Optional[str] = None,
+                    api_key: Optional[str] = None) -> LLMProvider:
+    """
+    Factory function to get an LLM provider based on type
+    """
+    provider_type = provider_type.lower()
+    
+    # Default model names for each provider
+    default_models = {
+        "ollama": "cas/spaetzle-v85-7b",
+        "groq": "llama-3.1-70b-versatile",
+        "openai": "gpt-3.5-turbo",
+        "cohere": "command-r-plus",
+        "huggingface": "mistralai/Mistral-7B-Instruct-v0.3",
+        "glhf": "mistralai/Mistral-7B-Instruct-v0.3"
+    }
+    
+    # Use default model if none specified
+    if not model_name:
+        model_name = default_models.get(provider_type, default_models["ollama"])
+    
+    if provider_type == "ollama":
+        return OllamaProvider(model_name=model_name)
+    elif provider_type == "groq":
+        return GroqProvider(model_name=model_name, api_key=api_key)
+    elif provider_type == "openai":
+        return OpenAIProvider(model_name=model_name, api_key=api_key)
+    elif provider_type == "cohere":
+        return CohereProvider(model_name=model_name, api_key=api_key)
+    elif provider_type == "huggingface":
+        return HuggingFaceProvider(model_name=model_name, api_key=api_key)
+    elif provider_type == "glhf":
+        return GLHFProvider(model_name=model_name, api_key=api_key)
+    else:
+        raise ValueError(f"Unknown provider type: {provider_type}")
+
+
+def send_to_llm(text: str, filename: str, provider: Union[str, LLMProvider], 
+              model_name: Optional[str] = None,
+              api_key: Optional[str] = None,
+              max_attempts: int = 5,
+              verbose: bool = False) -> str:
+    """
+    Extract metadata from text using an LLM provider
+    
+    Args:
+        text: Text to analyze
+        filename: Filename for context
+        provider: Provider type string ('ollama', 'groq', 'poe') or LLMProvider instance
+        model_name: Optional model name to use
+        api_key: Optional API key for cloud providers
+        max_attempts: Maximum retry attempts
+        verbose: Whether to print debug information
+        
+    Returns:
+        str: The formatted metadata response
+    """
+    # Get or validate provider
+    if isinstance(provider, str):
+        try:
+            llm_provider = get_llm_provider(provider, model_name, api_key)
+        except ImportError as e:
+            logging.error(f"Failed to initialize {provider} provider: {str(e)}")
+            # Fall back to Ollama if available
+            try:
+                llm_provider = get_llm_provider("ollama")
+                logging.info(f"Falling back to Ollama provider")
+            except ImportError:
+                raise ImportError("No LLM providers available. Install at least one client library.")
+    else:
+        llm_provider = provider
+    
+    base_retry_wait = 2  # Base wait time in seconds
+    
+    # Prepare different prompt templates to try if earlier ones fail
+    prompt_templates = [
+        # First attempt - simple structured format
+        (
+            f"Extract the author name (lastname surname) of the main author (ignore other authors), "
+            f"year of publication, title, and language from the following text, considering the filename '{os.path.basename(filename)}' "
+            f"which may contain clues. I need the output **only** in the following format with no additional text or explanations: \n"
+            f"<TITLE>The publication title</TITLE>\n<YEAR>2023</YEAR>\n<AUTHOR>Lastname Firstname</AUTHOR>\n<LANGUAGE>en</LANGUAGE>\n\n"
+        ),
+        # Second attempt - emphasize exact format
+        (
+            f"I need to extract metadata from a document. Please give me ONLY these four tags with the information, and nothing else:\n"
+            f"<TITLE>The exact title</TITLE>\n<YEAR>The publication year (4 digits)</YEAR>\n<AUTHOR>The author's name in 'Lastname Firstname' format</AUTHOR>\n<LANGUAGE>The language code</LANGUAGE>\n\n"
+            f"Document filename: {os.path.basename(filename)}\n"
+        ),
+        # Third attempt - even more explicit
+        (
+            f"You are a metadata extraction tool. Extract these fields from the text:\n"
+            f"1. TITLE (the full publication title)\n"
+            f"2. YEAR (the 4-digit publication year, use 'Unknown' if not found)\n"
+            f"3. AUTHOR (format as 'Lastname Firstname', preserve any commas)\n"
+            f"4. LANGUAGE (the 2-letter language code, e.g., 'en', 'de', 'fr')\n\n"
+            f"Format your response EXACTLY like this with no other text:\n"
+            f"<TITLE>The title</TITLE>\n<YEAR>2023</YEAR>\n<AUTHOR>Smith John</AUTHOR>\n<LANGUAGE>en</LANGUAGE>\n\n"
+        )
+    ]
+    
+    # Try different prompt templates if we encounter format issues
+    attempt = 1
+    while attempt <= max_attempts:
+        # Choose prompt template based on attempt number
+        template_index = min(attempt - 1, len(prompt_templates) - 1)
+        prompt_template = prompt_templates[template_index]
+        
+        logging.debug(f"Consulting LLM on file: {filename} (Attempt: {attempt}, Template: {template_index + 1})")
+        
+        # Build the final prompt with text sample
+        prompt = prompt_template + f"Here is the document text:\n{text[:3000]}"  # Limit text to avoid token limits
+        messages = [{"role": "user", "content": prompt}]
+        
+        try:
+            response = llm_provider.chat_completion(
+                messages=messages,
+                temperature=0.5,  # Reduced temperature for more consistent formatting
+                max_tokens=250,
+                timeout=120  # 2 minute timeout
+            )
+            
+            output = response["content"]
+            if verbose:
+                logging.debug(f"Metadata content received from LLM: {output}")
+            
+            # Validate the response has the expected format
+            metadata = parse_metadata(output, verbose=verbose)
+            if metadata:
+                return output
+            else:
+                logging.warning(f"Unexpected response format from LLM: {output}")
+                # Less aggressive backoff for format issues
+                if attempt < max_attempts:
+                    wait_time = base_retry_wait * (1.5 ** (attempt - 1))  # Gentler exponential backoff
+                    logging.info(f"Retrying with different prompt in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                    attempt += 1
+                    continue
+                return output
+            
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
+                # Use exponential backoff for rate limiting/timeouts
+                wait_time = base_retry_wait * (2 ** (attempt - 1))  # Exponential backoff
+                logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
+                time.sleep(wait_time)
+                attempt += 1
+                continue
+            else:
+                logging.error(f"Error communicating with LLM for {filename}: {e}")
+                if attempt < max_attempts:
+                    wait_time = base_retry_wait * (1.5 ** (attempt - 1))  # Gentler exponential backoff
+                    logging.info(f"Retrying in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                    attempt += 1
+                    continue
+            return ""
+            
+    logging.error(f"Maximum retry attempts reached for LLM request.")
+    return ""
+
 class ImportCache:
     """Global cache for imports and their availability"""
     _instance = None
@@ -262,10 +882,11 @@ class ExtractionManager:
     def extract(self, input_path: str, 
         output_path: Optional[str] = None,
         method: Optional[str] = None,
+        ocr_method: Optional[str] = None,
         password: Optional[str] = None,
         extract_tables: bool = False,
         sort: bool = False,     # with callback for sort processing
-        openai_client = None,
+        llm_provider = None,      
         rename_script_path: Optional[str] = None,
         **kwargs) -> Union[str, bool]:
         """
@@ -308,6 +929,7 @@ class ExtractionManager:
                 text = extractor.extract_text(
                     input_path,
                     preferred_method=method,
+                    ocr_method=ocr_method,
                     progress_callback=progress_callback,
                     **extraction_kwargs
                 )
@@ -317,17 +939,17 @@ class ExtractionManager:
                 logging.warning("Extracted text may be of low quality")
             
             # Handle sorting if requested
-            if sort and openai_client and rename_script_path and text:
+            if sort and llm_provider and rename_script_path and text:
                 try:
                     # Get metadata from Ollama server
-                    metadata_content = send_to_ollama_server(text, input_path, openai_client)
+                    metadata_content = extract_metadata(text, input_path, llm_provider)
                     if metadata_content:
                         metadata = parse_metadata(metadata_content)
                         if metadata:
                             # Process author names
                             author = metadata['author']
                             logging.debug(f"extracted author: {author}")
-                            corrected_author = sort_author_names(author, openai_client)
+                            corrected_author = sort_author_names(author, llm_provider)
                             logging.debug(f"corrected author: {corrected_author}")
                             metadata['author'] = corrected_author
                             
@@ -974,18 +1596,21 @@ class PDFExtractor:
         try:
             import pytesseract
             import pdf2image
-            if self._binaries.get('tesseract', False):
-                # Verify tesseract works
-                try:
-                    pytesseract.get_tesseract_version()
-                    self._initialized_methods.add('tesseract')
-                    if self._debug:
-                        logging.debug("Tesseract OCR available")
-                except Exception as e:
-                    if self._debug:
-                        logging.debug(f"Tesseract not working: {e}")
+            
+            # Verify tesseract works by checking the version
+            try:
+                version = pytesseract.get_tesseract_version()
+                self._pytesseract = pytesseract
+                self._pdf2image = pdf2image
+                self._initialized_methods.add('tesseract')
+                if self._debug:
+                    logging.debug(f"Found Tesseract version: {version}")
+            except Exception as e:
+                if self._debug:
+                    logging.debug(f"Tesseract check failed: {e}")
         except ImportError:
-            pass
+            if self._debug:
+                logging.debug("pytesseract or pdf2image not available")
 
         # Skip problematic OCR dependencies in normal operation
         # They'll be checked when actually needed
@@ -1111,21 +1736,26 @@ class PDFExtractor:
         """Extract text with optimized fallback methods"""
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"File not found: {pdf_path}")
-            
-        # Start with reliable methods only
-        methods = ['pymupdf', 'pdfplumber', 'pypdf']  # Fast and reliable methods
+                
+        # Start with fast methods first
+        methods = ['pymupdf', 'pdfplumber', 'pypdf', 'pdfminer']  # Fast and reliable methods
         
-        # You might want to skip problematic OCR methods
+        # Define OCR methods
         ocr_methods = ['tesseract', 'doctr', 'easyocr', 'kraken']
+        
+        # If a specific preferred method is provided and it's an OCR method,
+        # move it to the front of the OCR methods list
+        if preferred_method and preferred_method in ocr_methods:
+            # Remove it from its current position if present
+            if preferred_method in ocr_methods:
+                ocr_methods.remove(preferred_method)
+            # Add it to the front of OCR methods
+            ocr_methods.insert(0, preferred_method)
+            if self._debug:
+                logging.info(f"Prioritizing OCR method: {preferred_method}")
+        
         text_parts = []
         current_method = None
-
-        # Handle preferred method
-        if preferred_method:
-            if preferred_method not in self.TEXT_METHODS:
-                raise ValueError(f"Invalid method: {preferred_method}")
-            if preferred_method in self._initialized_methods:
-                methods.insert(0, preferred_method)
 
         try:
             # Try fast methods first
@@ -1143,7 +1773,7 @@ class PDFExtractor:
                     
                     extraction_func = getattr(self, f'extract_with_{method}')
                     
-                    # Check for keyboard interrupt more frequently
+                    # Extract text
                     try:
                         text = extraction_func(
                             pdf_path,
@@ -1179,7 +1809,7 @@ class PDFExtractor:
                     logging.info("Initial extraction insufficient, trying OCR methods...")
                 
                 for method in ocr_methods:
-                    if method not in self._initialized_methods:
+                    if method not in self._initialized_methods and not self._is_method_available(method):
                         continue
                         
                     try:
@@ -1190,7 +1820,7 @@ class PDFExtractor:
                         if progress_callback:
                             progress_callback(0, method)
                             
-                        # Use _init_ocr to check/initialize OCR method
+                        # Initialize OCR method
                         if not self._init_ocr(method):
                             if self._debug:
                                 logging.debug(f"Skipping {method} - initialization failed")
@@ -1198,7 +1828,7 @@ class PDFExtractor:
                             
                         extraction_func = getattr(self, f'extract_with_{method}')
                         
-                        # Check for keyboard interrupt more frequently
+                        # Extract text
                         try:
                             text = extraction_func(
                                 pdf_path,
@@ -1220,7 +1850,7 @@ class PDFExtractor:
                     except Exception as e:
                         if self._debug:
                             logging.error(f"Error with {method}: {e}")
-                        self._ocr_failed_methods.add(method)  # Remember this method failed
+                        self._ocr_failed_methods.add(method)
                         continue
                     finally:
                         if progress_callback and current_method == method:
@@ -1591,18 +2221,281 @@ class PDFExtractor:
             if 'output' in locals():
                 output.close()
     
+    def extract_with_doctr(self, pdf_path: str, progress_callback=None) -> str:
+        """Extract text using docTR with proper API handling."""
+        if not self._init_ocr('doctr'):
+            return ""
+            
+        try:
+            # Use proper docTR imports and API
+            doctr = self._doctr
+            
+            # Load document
+            with tqdm(desc="Loading document", unit="file") as pbar:
+                try:
+                    # Load PDF document
+                    doc = doctr.io.DocumentFile.from_pdf(pdf_path)
+                    pbar.update(1)
+                except Exception as e:
+                    logging.error(f"DocTR document loading failed: {e}")
+                    return ""
+            
+            # Initialize predictor if needed
+            if not hasattr(self, '_doctr_predictor') or self._doctr_predictor is None:
+                try:
+                    # Initialize OCR predictor with default pretrained model
+                    self._doctr_predictor = doctr.models.ocr_predictor(pretrained=True)
+                    logging.info("DocTR OCR predictor initialized")
+                except Exception as e:
+                    logging.error(f"Failed to initialize DocTR predictor: {e}")
+                    return ""
+            
+            # Process document with predictor
+            try:
+                # Use the predictor on the whole document at once
+                result = self._doctr_predictor(doc)
+                
+                # Extract text from result with proper error handling
+                text_parts = []
+                
+                # Fix: Safely access text content
+                try:
+                    for page_idx, page in enumerate(result.pages):
+                        # Safe access to text property
+                        try:
+                            page_export = page.export()
+                            if isinstance(page_export, dict) and "text" in page_export:
+                                page_text = page_export["text"]
+                                if page_text:
+                                    text_parts.append(page_text)
+                            else:
+                                logging.warning(f"DocTR: Missing text in page {page_idx} export")
+                        except Exception as page_e:
+                            logging.warning(f"DocTR: Error exporting page {page_idx}: {page_e}")
+                            continue
+                except Exception as e:
+                    logging.error(f"DocTR: Error processing result pages: {e}")
+                    return ""
+                    
+                if progress_callback:
+                    # Signal completion
+                    progress_callback(len(doc))
+                    
+                return "\n\n".join(text_parts)
+                
+            except Exception as e:
+                logging.error(f"DocTR prediction failed: {e}")
+                return ""
+                
+        except Exception as e:
+            logging.error(f"DocTR extraction failed: {e}")
+            return ""
+        finally:
+            self._clear_gpu_memory()
+
+
+
+    def extract_with_kraken(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using Kraken with correct API usage.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
+        if not self._init_ocr('kraken'):
+            return ""
+        
+        # Import minimal dependencies
+        pdf2image = self._import_cache.import_module('pdf2image') 
+        
+        text_parts = []
+        images = None
+            
+        try:
+            # Convert PDF to images (this is thread-safe)
+            with tqdm(desc="Converting PDF to images for Kraken", unit="page") as pbar:
+                images = pdf2image.convert_from_path(
+                    pdf_path,
+                    dpi=300,
+                    thread_count=1,  # Use single thread for conversion
+                    grayscale=True
+                )
+                pbar.update(len(images))
+            
+            # Process images with safer approach
+            with tqdm(total=len(images), desc="Kraken processing", unit="page") as pbar:
+                # Import kraken correctly
+                import kraken
+                
+                for i, image in enumerate(images, 1):
+                    try:
+                        # Use correct Kraken API modules based on documentation
+                        # First binarize the image
+                        binarized = kraken.binarization.nlbin(image)
+                        
+                        # Segment the image
+                        segments = kraken.pageseg.segment(binarized)
+                        
+                        # Perform text recognition if available
+                        try:
+                            # Use the rpred module directly as shown in docs
+                            if hasattr(kraken, 'rpred'):
+                                # Simple model-less recognition for testing
+                                text = kraken.rpred.rpred(None, image, segments)
+                                if text:
+                                    text_parts.append(text)
+                                else:
+                                    text_parts.append(f"[Kraken extracted {len(segments['boxes'])} text segments]")
+                        except Exception as recog_error:
+                            if self._debug:
+                                logging.debug(f"Kraken recognition error: {recog_error}")
+                            # Fall back to simple text extraction from segments
+                            text_parts.append(f"[Kraken extracted {len(segments['boxes'])} text segments]")
+                        
+                        pbar.update(1)
+                        if progress_callback:
+                            progress_callback(1)
+                            
+                    except Exception as e:
+                        logging.error(f"Kraken failed on page {i}: {e}")
+                        continue
+                    finally:
+                        image.close()
+                        
+        except Exception as e:
+            logging.error(f"Kraken extraction failed: {e}")
+            return ""
+        finally:
+            if images:
+                for img in images:
+                    try:
+                        img.close()
+                    except:
+                        pass
+            
+        return '\n\n'.join(text_parts)
+
+
+    def extract_with_easyocr(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using EasyOCR with proper API.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
+        if not self._init_ocr('easyocr'):
+            return ""
+        
+        try:
+            # Import required dependencies here to ensure they're available
+            pdf2image = self._import_cache.import_module('pdf2image')
+            import torch  # Add explicit torch import here
+            
+            text_parts = []
+            images = None
+            
+            try:
+                # Convert PDF to images (thread-safe)
+                with tqdm(desc="Converting PDF to images for EasyOCR", unit="page") as pbar:
+                    images = pdf2image.convert_from_path(
+                        pdf_path,
+                        dpi=300,
+                        thread_count=1,  # Single thread for stability
+                        grayscale=True
+                    )
+                    pbar.update(len(images))
+                
+                # Initialize reader if needed
+                easyocr = self._easyocr
+                reader = None
+                
+                # Initialize reader with English as default language
+                try:
+                    if not hasattr(self, '_reader') or self._reader is None:
+                        reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+                        self._reader = reader
+                    else:
+                        reader = self._reader
+                except Exception as init_error:
+                    logging.error(f"EasyOCR reader initialization failed: {init_error}")
+                    return ""
+                
+                # Process pages
+                with tqdm(total=len(images), desc="EasyOCR processing", unit="page") as pbar:
+                    for i, image in enumerate(images, 1):
+                        try:
+                            # Process page using EasyOCR
+                            results = reader.readtext(
+                                image,
+                                detail=0,  # Just get the text
+                                paragraph=True  # Combine text into paragraphs
+                            )
+                            
+                            # Add extracted text
+                            if results:
+                                text_parts.append('\n'.join(results))
+                            else:
+                                text_parts.append(f"[EasyOCR found no text on page {i}]")
+                            
+                            # Update progress
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                        except Exception as e:
+                            logging.error(f"EasyOCR failed on page {i}: {e}")
+                        finally:
+                            image.close()
+                            
+            finally:
+                # Clean up resources
+                if images:
+                    for img in images:
+                        try:
+                            img.close()
+                        except:
+                            pass
+                
+                # Clear GPU memory
+                self._clear_gpu_memory()
+            
+            return '\n\n'.join(text_parts)
+        
+        except Exception as e:
+            logging.error(f"EasyOCR extraction failed: {e}")
+            return ""
+
+
     def _init_ocr(self, method: str) -> bool:
-        """Initialize OCR engine with enhanced error handling and dependency checks"""
+        """
+        Initialize OCR engine with correct dependency checks and API usage.
+        
+        Args:
+            method: OCR method to initialize
+            
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
         if method not in self._ocr_initialized:
-            # Early check - don't retry initialization if we've already determined it's unavailable
+            # Skip if already determined to be unavailable
             if method in self._ocr_failed_methods:
                 return False
-                
+            
+            # Check if we're in the main thread
+            in_main_thread = threading.current_thread() is threading.main_thread()
+            
             try:
                 if method == 'tesseract':
-                    # Tesseract is the most reliable OCR method - try it first
+                    # Check basic dependencies for tesseract
                     try:
-                        # Check binary availability first before attempting imports
+                        # Check binary availability first
                         if not shutil.which('tesseract'):
                             if self._debug:
                                 logging.debug("Tesseract binary not found in PATH")
@@ -1612,18 +2505,10 @@ class PDFExtractor:
                         # Import dependencies
                         import pytesseract
                         import pdf2image
-                        import PIL.Image  # import as module, not as name
-                        
-                        if not (pytesseract and pdf2image and PIL.Image):
-                            if self._debug:
-                                logging.debug("Missing dependencies for Tesseract OCR")
-                            self._ocr_initialized[method] = False
-                            return False
                         
                         # Store the imported modules for later use
                         self._pytesseract = pytesseract
                         self._pdf2image = pdf2image
-                        self._PIL = PIL
                         
                         # Verify Tesseract installation
                         try:
@@ -1631,214 +2516,145 @@ class PDFExtractor:
                             if self._debug:
                                 logging.debug(f"Found Tesseract version: {version}")
                             self._ocr_initialized[method] = True
+                            return True
                         except Exception as e:
                             if self._debug:
                                 logging.debug(f"Tesseract verification failed: {e}")
                             self._ocr_initialized[method] = False
-                            
+                            return False
                     except Exception as e:
                         if self._debug:
                             logging.debug(f"Tesseract initialization error: {e}")
                         self._ocr_initialized[method] = False
+                        return False
+                        
+                elif method == 'doctr':
+                    try:
+                        # Check if doctr is importable without initializing models
+                        if not self._import_cache.is_available('doctr'):
+                            if self._debug:
+                                logging.debug("DocTR not available")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Import doctr without initializing models
+                        import doctr
+                        
+                        # Check if doctr has the required modules
+                        if not hasattr(doctr, 'io') or not hasattr(doctr, 'models'):
+                            if self._debug:
+                                logging.debug("DocTR missing required modules")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Store module references
+                        self._doctr = doctr
+                        
+                        # Mark as initialized with deferred model loading
+                        self._ocr_initialized[method] = True
+                        self._doctr_predictor_loaded = False
+                        return True
+                            
+                    except ImportError as e:
+                        if self._debug:
+                            logging.debug(f"DocTR import error: {e}")
+                        self._ocr_initialized[method] = False
+                        return False
                         
                 elif method == 'kraken':
-                    # Check if we should attempt kraken at all
+                    # Check for kraken availability
+                    if not self._import_cache.is_available('kraken'):
+                        if self._debug:
+                            logging.debug("Kraken not available")
+                        self._ocr_initialized[method] = False
+                        return False
+                    
                     try:
-                        # Disable excessive debug logging from kraken
-                        logging.getLogger('kraken').setLevel(logging.WARNING)
+                        # Import kraken correctly based on documentation
+                        import kraken
                         
-                        # Use safer try/except import rather than direct import
-                        kraken_lib = self._safe_import('kraken.lib')
-                        kraken_binarization = self._safe_import('kraken.binarization')
-                        kraken_pageseg = self._safe_import('kraken.pageseg')
-                        kraken_recognition = self._safe_import('kraken.recognition')
+                        # Check for the necessary modules according to docs
+                        has_binarization = hasattr(kraken, 'binarization')
+                        has_pageseg = hasattr(kraken, 'pageseg')
+                        has_rpred = hasattr(kraken, 'rpred')
                         
-                        if not (kraken_lib and kraken_binarization and kraken_pageseg and kraken_recognition):
+                        if not (has_binarization and has_pageseg and has_rpred):
                             if self._debug:
                                 logging.debug("Missing one or more Kraken modules")
                             self._ocr_initialized[method] = False
                             return False
                         
-                        # Try model loading with better error handling
-                        try:
-                            model = None
-                            
-                            # Approach 1: Try kraken.lib.models
-                            try:
-                                if hasattr(kraken_lib, 'models') and hasattr(kraken_lib.models, 'load_any'):
-                                    model = kraken_lib.models.load_any("en-default.mlmodel")
-                            except Exception as e:
-                                if self._debug:
-                                    logging.debug(f"Kraken model loading approach 1 failed: {e}")
-                            
-                            # Approach 2: Try kraken.recognition.load_any
-                            if not model and hasattr(kraken_recognition, 'load_any'):
-                                try:
-                                    model = kraken_recognition.load_any("en-default.mlmodel")
-                                except Exception as e:
-                                    if self._debug:
-                                        logging.debug(f"Kraken model loading approach 2 failed: {e}")
-                            
-                            if model:
-                                self._model = model
-                                self._ocr_initialized[method] = True
-                            else:
-                                if self._debug:
-                                    logging.debug("Could not load Kraken model")
-                                self._ocr_initialized[method] = False
-                                
-                        except Exception as e:
-                            if self._debug:
-                                logging.debug(f"Kraken model loading failed: {e}")
-                            self._ocr_initialized[method] = False
-                            
-                    except Exception as e:
-                        if self._debug:
-                            logging.debug(f"Kraken initialization failed: {e}")
-                        self._ocr_initialized[method] = False
+                        # Store modules for later use
+                        self._kraken = kraken
+                        self._kraken_binarization = kraken.binarization
+                        self._kraken_pageseg = kraken.pageseg
+                        self._kraken_rpred = kraken.rpred
                         
-                elif method == 'doctr':
-                    # Skip initialization on Windows if using Python 3.12 due to numpy/torch compatibility issues
-                    if platform.system() == 'Windows' and sys.version_info >= (3, 12):
+                        # Mark as initialized with deferred model loading
+                        self._ocr_initialized[method] = True
+                        self._kraken_model_loaded = False
+                        return True
+                            
+                    except ImportError as e:
                         if self._debug:
-                            logging.debug("Skipping DocTR initialization - not compatible with Python 3.12 on Windows")
+                            logging.debug(f"Kraken import error: {e}")
                         self._ocr_initialized[method] = False
                         return False
-                    
-                    try:
-                        # Use safer imports
-                        doctr_module = self._safe_import('doctr')
-                        torch_module = self._safe_import('torch')
-                        
-                        if not (doctr_module and torch_module):
-                            if self._debug:
-                                logging.debug("Missing dependencies for DocTR")
-                            self._ocr_initialized[method] = False
-                            return False
-                        
-                        # Check if doctr has the required modules
-                        if not hasattr(doctr_module, 'models') or not hasattr(doctr_module.models, 'ocr_predictor'):
-                            if self._debug:
-                                logging.debug("DocTR missing required modules or functions")
-                            self._ocr_initialized[method] = False
-                            return False
-                        
-                        # Configure torch
-                        if hasattr(torch_module, 'set_warn_always'):
-                            torch_module.set_warn_always(False)
-                        
-                        # Pick device safely
-                        device = 'cpu'  # Default to CPU which is safer
-                        if torch_module.cuda.is_available():
-                            try:
-                                # Test CUDA before using it
-                                torch_module.zeros(1).cuda()
-                                device = 'cuda'
-                            except Exception as e:
-                                if self._debug:
-                                    logging.debug(f"CUDA available but failed initialization: {e}")
-                        
-                        # Initialize DocTR with timeout
-                        try:
-                            with timeout(30):  # 30 second timeout for model loading
-                                self._predictor = doctr_module.models.ocr_predictor(pretrained=True).to(device)
-                                self._ocr_initialized[method] = True
-                        except TimeoutError:
-                            if self._debug:
-                                logging.debug("DocTR initialization timed out")
-                            self._ocr_initialized[method] = False
-                        except Exception as e:
-                            if self._debug:
-                                logging.debug(f"DocTR predictor initialization failed: {e}")
-                            self._ocr_initialized[method] = False
-                            
-                    except Exception as e:
-                        if self._debug:
-                            logging.debug(f"DocTR initialization failed: {e}")
-                        self._ocr_initialized[method] = False
                         
                 elif method == 'easyocr':
-                    # Skip initialization on Windows if using Python 3.12 due to numpy/torch compatibility issues
-                    if platform.system() == 'Windows' and sys.version_info >= (3, 12):
+                    if not self._import_cache.is_available('easyocr'):
                         if self._debug:
-                            logging.debug("Skipping EasyOCR initialization - not compatible with Python 3.12 on Windows")
+                            logging.debug("EasyOCR not available")
                         self._ocr_initialized[method] = False
                         return False
                         
-                    try:
-                        # Use safer imports
-                        easyocr_module = self._safe_import('easyocr')
-                        torch_module = self._safe_import('torch')
-                        
-                        if not (easyocr_module and torch_module):
-                            if self._debug:
-                                logging.debug("Missing dependencies for EasyOCR")
-                            self._ocr_initialized[method] = False
-                            return False
-                        
-                        # Check GPU safely
-                        gpu = False
-                        if torch_module.cuda.is_available():
-                            try:
-                                # Test CUDA before using it
-                                torch_module.zeros(1).cuda()
-                                gpu = True
-                            except Exception as e:
-                                if self._debug:
-                                    logging.debug(f"CUDA available but failed initialization: {e}")
-                        
-                        # Initialize Reader with timeout and try to prevent downloads
-                        try:
-                            with timeout(30):  # 30 second timeout for model loading
-                                self._reader = easyocr_module.Reader(
-                                    ['en'],
-                                    gpu=gpu,
-                                    model_storage_directory='./models',
-                                    download_enabled=False  # Try to prevent automatic downloads
-                                )
-                                self._ocr_initialized[method] = True
-                        except TimeoutError:
-                            if self._debug:
-                                logging.debug("EasyOCR initialization timed out")
-                            self._ocr_initialized[method] = False
-                        except Exception as e:
-                            if self._debug:
-                                logging.debug(f"EasyOCR reader initialization failed: {e}")
-                            self._ocr_initialized[method] = False
-                            
-                    except Exception as e:
+                    # Check if torch is available
+                    if not self._import_cache.is_available('torch'):
                         if self._debug:
-                            logging.debug(f"EasyOCR initialization failed: {e}")
+                            logging.debug("PyTorch not available for EasyOCR")
                         self._ocr_initialized[method] = False
-                else:
-                    # Unsupported method
-                    if self._debug:
-                        logging.debug(f"Unsupported OCR method: {method}")
-                    self._ocr_initialized[method] = False
+                        return False
                     
+                    try:
+                        # Import easyocr according to docs
+                        import easyocr
+                        import torch  # Explicitly import torch here
+                        
+                        # Store module reference
+                        self._easyocr = easyocr
+                        
+                        # Mark as initialized with deferred reader creation
+                        self._ocr_initialized[method] = True
+                        self._easyocr_reader_loaded = False
+                        return True
+                            
+                    except ImportError as e:
+                        if self._debug:
+                            logging.debug(f"EasyOCR import error: {e}")
+                        self._ocr_initialized[method] = False
+                        return False
+                        
             except Exception as e:
                 # Catch all other errors
                 if self._debug:
                     logging.debug(f"Failed to initialize {method}: {e}")
                 self._ocr_initialized[method] = False
-                
-                # Remember methods that failed initialization to avoid repeated attempts
-                if not hasattr(self, '_ocr_failed_methods'):
-                    self._ocr_failed_methods = set()
                 self._ocr_failed_methods.add(method)
         
         # Return cached result
         return self._ocr_initialized.get(method, False)
 
+
     def extract_with_tesseract(self, pdf_path: str, progress_callback=None) -> str:
         """Extract text using Tesseract OCR with progress bars"""
-        if not self._init_ocr('tesseract'):
+        # First verify tesseract is actually available
+        if 'tesseract' not in self._initialized_methods:
+            logging.error("Tesseract not available in initialized methods")
             return ""
             
-        # Use the stored module references instead of importing again
+        # Use the stored module references
         pytesseract = self._pytesseract
         pdf2image = self._pdf2image
-        PIL = self._PIL
         
         text_parts = []
         images = None
@@ -1846,27 +2662,44 @@ class PDFExtractor:
         try:
             # Convert PDF to images with progress bar
             with tqdm(desc="Converting PDF to images for tesseract", unit="page") as pbar:
-                images = pdf2image.convert_from_path(
-                    pdf_path,
-                    dpi=300,
-                    thread_count=os.cpu_count() or 1,
-                    grayscale=True,
-                    size=(None, 2000)  # Limit height for memory
-                )
-                pbar.update(len(images))
+                try:
+                    images = pdf2image.convert_from_path(
+                        pdf_path,
+                        dpi=300,
+                        thread_count=1,  # Use single thread for stability
+                        grayscale=True,
+                        size=(None, 2000),  # Limit height for memory
+                        use_cropbox=True,   # Use cropbox for extraction
+                        strict=False        # Continue even with errors
+                    )
+                    pbar.update(len(images))
+                except Exception as e:
+                    logging.error(f"PDF to image conversion failed: {e}")
+                    # Try alternative conversion options
+                    try:
+                        logging.info("Trying alternative conversion method...")
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            dpi=150,  # Lower DPI
+                            thread_count=1,
+                            grayscale=True,
+                            first_page=1,
+                            last_page=None,
+                            strict=False
+                        )
+                        pbar.update(len(images))
+                    except Exception as e2:
+                        logging.error(f"Alternative conversion also failed: {e2}")
+                        return ""
             
             # Process images with OCR
             with tqdm(total=len(images), desc="OCR Processing with tesseract", unit="page") as pbar:
                 for i, image in enumerate(images, 1):
                     try:
-                        # Preprocess image
-                        image = self._preprocess_image(image)
-                        
                         # OCR with optimized settings
                         text = pytesseract.image_to_string(
                             image,
-                            config='--oem 3 --psm 3',
-                            lang='+'.join(self.languages)
+                            config='--oem 3 --psm 3 -l eng',  # Specify language and PSM mode
                         )
                         
                         if text.strip():
@@ -1880,9 +2713,16 @@ class PDFExtractor:
                         logging.error(f"OCR failed on page {i}: {e}")
                         continue
                     finally:
-                        image.close()
-                        
+                        if image:
+                            try:
+                                image.close()
+                            except:
+                                pass
+        except Exception as e:
+            logging.error(f"Tesseract OCR extraction failed: {e}")
+            return ""
         finally:
+            # Clean up resources
             if images:
                 for img in images:
                     try:
@@ -1890,7 +2730,12 @@ class PDFExtractor:
                     except:
                         pass
         
-        return '\n\n'.join(text_parts)
+        # Return combined text if any was extracted
+        if text_parts:
+            return '\n\n'.join(text_parts)
+        else:
+            logging.warning("No text extracted using Tesseract OCR")
+            return ""
 
 
     def _preprocess_image(self, image) -> 'PIL.Image':
@@ -1925,92 +2770,6 @@ class PDFExtractor:
             return int(mean - constant * std)
         except:
             return 127
-
-    def extract_with_easyocr(self, pdf_path: str, progress_callback=None) -> str:
-        """Extract text using EasyOCR with GPU support"""
-        if not self._init_ocr('easyocr'):
-            return ""
-            
-        pdf2image = self._import_cache.import_module('pdf2image')
-        numpy = self._import_cache.import_module('numpy')
-        
-        text_parts = []
-        images = None
-        
-        try:
-            images = pdf2image.convert_from_path(
-                pdf_path,
-                dpi=300,
-                thread_count=os.cpu_count() or 1,
-                grayscale=True
-            )
-            
-            for i, image in enumerate(images, 1):
-                try:
-                    # Convert to numpy array
-                    img_array = numpy.array(image)
-                    
-                    # Perform OCR
-                    results = self._reader.readtext(
-                        img_array,
-                        detail=0,
-                        paragraph=True,
-                        batch_size=4
-                    )
-                    
-                    if results:
-                        text_parts.append('\n'.join(results))
-                    
-                    if progress_callback:
-                        progress_callback(1)
-                        
-                except Exception as e:
-                    logging.error(f"EasyOCR failed on page {i}: {e}")
-                    continue
-                finally:
-                    image.close()
-                    
-        finally:
-            if images:
-                for img in images:
-                    try:
-                        img.close()
-                    except:
-                        pass
-            
-            # Clear GPU memory
-            self._clear_gpu_memory()
-        
-        return '\n\n'.join(text_parts)
-
-    def extract_with_doctr(self, pdf_path: str, progress_callback=None) -> str:
-        """Extract text using DocTR with progress bars"""
-        if not self._init_ocr('doctr'):
-            return ""
-            
-        doctr = self._import_cache.import_module('doctr')
-        
-        try:
-            with tqdm(desc="Loading document for doctr", unit="file") as pbar:
-                doc = doctr.io.DocumentFile.from_pdf(pdf_path)
-                pbar.update(1)
-            
-            with tqdm(desc="DocTR processing", unit="page") as pbar:
-                result = self._predictor(doc)
-                pbar.update(len(doc))
-            
-            text = result.render()
-            
-            if progress_callback:
-                progress_callback(len(doc))
-            
-            return text.strip()
-            
-        except Exception as e:
-            logging.error(f"DocTR extraction failed: {e}")
-            return ""
-        finally:
-            self._clear_gpu_memory()
             
     def _configure_torch_security(self):
         """Configure PyTorch security settings"""
@@ -2060,66 +2819,6 @@ class PDFExtractor:
             except:
                 pass
 
-    def extract_with_kraken(self, pdf_path: str, progress_callback=None) -> str:
-        """Extract text using Kraken with progress bars"""
-        if not self._init_ocr('kraken'):
-            return ""
-            
-        kraken = self._import_cache.import_module('kraken')
-        pdf2image = self._import_cache.import_module('pdf2image')
-        numpy = self._import_cache.import_module('numpy')
-        
-        text_parts = []
-        images = None
-        
-        try:
-            # Convert PDF to images with progress
-            with tqdm(desc="Converting PDF to images for kraken", unit="page") as pbar:
-                images = pdf2image.convert_from_path(
-                    pdf_path,
-                    dpi=300,
-                    thread_count=os.cpu_count() or 1,
-                    grayscale=True
-                )
-                pbar.update(len(images))
-            
-            # Process images with progress
-            with tqdm(total=len(images), desc="Kraken processing", unit="page") as pbar:
-                for i, image in enumerate(images, 1):
-                    try:
-                        img_array = numpy.array(image)
-                        
-                        # Binarization with progress update
-                        binarized = kraken.binarization.nlbin(img_array)
-                        
-                        # Segment
-                        segments = kraken.pageseg.segment(binarized)
-                        
-                        # Recognize
-                        text = kraken.rpred.rpred(self._model, img_array, segments)
-                        
-                        if text.strip():
-                            text_parts.append(text.strip())
-                        
-                        pbar.update(1)
-                        if progress_callback:
-                            progress_callback(1)
-                            
-                    except Exception as e:
-                        logging.error(f"Kraken failed on page {i}: {e}")
-                        continue
-                    finally:
-                        image.close()
-                        
-        finally:
-            if images:
-                for img in images:
-                    try:
-                        img.close()
-                    except:
-                        pass
-        
-        return '\n\n'.join(text_parts)
     
 def setup_logging(verbosity: int = 0):
     """Set up logging configuration."""
@@ -2153,12 +2852,16 @@ class DocumentProcessor:
     def process_files(self, input_files: List[str], 
                 output_dir: Optional[str] = None,
                 method: Optional[str] = None,
+                ocr_method: Optional[str] = None,
                 password: Optional[str] = None,
                 extract_tables: bool = False,  
                 max_workers: int = None,
                 noskip: bool = False,
-                sort: bool = False,                # New parameter
-                rename_script_path: str = None,    # New parameter
+                sort: bool = False,                
+                rename_script_path: str = None,    
+                llm_provider = None,  
+                temperature: float = 0.7,     
+                max_tokens: int = 250,        
                 **kwargs) -> Dict[str, Any]:
         """Process multiple files with interrupt handling and optional sorting"""
         results = {}
@@ -2195,8 +2898,12 @@ class DocumentProcessor:
                         password,
                         extract_tables,
                         noskip,
-                        sort,                     # New parameter
-                        rename_script_path,       # New parameter
+                        sort,                     
+                        rename_script_path,       
+                        counters if 'counters' in locals() else None,
+                        llm_provider,
+                        temperature,
+                        max_tokens,
                         **kwargs
                     )
                     futures[future] = input_file
@@ -2321,14 +3028,14 @@ class DocumentProcessor:
         
         return str(output_path)
     
-    def _process_metadata_for_sorting(self, input_file, text, openai_client, rename_script_path, output_path=None):
+    def _process_metadata_for_sorting(self, input_file, text, llm_provider, rename_script_path, output_path=None):
         """
         Extract and process metadata for sorting/renaming files.
         
         Args:
             input_file: Path to the input file
             text: Extracted text content
-            openai_client: OpenAI client for Ollama communication
+            llm_provider: LLM provider instance or OpenAI client for Ollama
             rename_script_path: Path to write rename commands
             output_path: Path to the output text file
             
@@ -2343,10 +3050,18 @@ class DocumentProcessor:
         }
         
         try:
-            # Get metadata from Ollama server
-            metadata_content = send_to_ollama_server(text, input_file, openai_client)
+            # Get metadata using the appropriate provider
+            is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
+            
+            if is_openai_client:
+                # Using OpenAI client for Ollama
+                metadata_content = send_to_ollama_server(text, input_file, llm_provider)
+            else:
+                # Using an LLM provider instance
+                metadata_content = send_to_llm(text, input_file, llm_provider)
+                
             if not metadata_content:
-                result['error'] = "Failed to get metadata from Ollama server"
+                result['error'] = "Failed to get metadata from LLM provider"
                 return result
                 
             # Parse metadata with improved parser
@@ -2369,7 +3084,12 @@ class DocumentProcessor:
                 result['error'] = "Missing or invalid author name"
                 return result
                 
-            corrected_author = sort_author_names(author, openai_client)
+            # Process author with appropriate provider
+            if is_openai_client:
+                corrected_author = sort_author_names(author, llm_provider)
+            else:
+                corrected_author = sort_author_names(author, llm_provider)
+                
             if not corrected_author or corrected_author == "UnknownAuthor":
                 result['error'] = "Failed to format author name correctly"
                 return result
@@ -2423,15 +3143,14 @@ class DocumentProcessor:
             
         return result
 
-    # This function would replace part of the _process_single_file method
-    def _handle_sorting(self, input_file, text, openai_client, rename_script_path, output_path, counters):
+    def _handle_sorting(self, input_file, text, llm_provider, rename_script_path, output_path, counters):
         """
         Handle sorting operations for a single file.
         
         Args:
             input_file: Path to the input file
             text: Extracted text content
-            openai_client: OpenAI client for Ollama communication
+            llm_provider: LLM provider instance or OpenAI client
             rename_script_path: Path to the rename script
             output_path: Path to the output text file
             counters: Dictionary of counters
@@ -2441,10 +3160,10 @@ class DocumentProcessor:
         """
         try:
             # Process metadata for sorting
-            sort_result = _process_metadata_for_sorting(
+            sort_result = self._process_metadata_for_sorting(
                 input_file=input_file,
                 text=text,
-                openai_client=openai_client,
+                llm_provider=llm_provider,
                 rename_script_path=rename_script_path,
                 output_path=output_path
             )
@@ -2492,12 +3211,16 @@ class DocumentProcessor:
     def _process_single_file(self, input_file: str,
                 output_dir: Optional[str] = None,
                 method: Optional[str] = None,
+                ocr_method: Optional[str] = None,
                 password: Optional[str] = None,
                 extract_tables: bool = False,
                 noskip: bool = False,
                 sort: bool = False,
                 rename_script_path: str = None,
                 counters: Dict[str, int] = None,
+                llm_provider = None,     
+                temperature: float = 0.7,
+                max_tokens: int = 250,
                 **kwargs) -> Dict[str, Any]:
         """
         Process a single document, with optimized skipping logic for sorting
@@ -2603,6 +3326,7 @@ class DocumentProcessor:
                 text = self.manager.extract(
                     input_file,
                     method=method,
+                    ocr_method=ocr_method,
                     password=password,
                     extract_tables=extract_tables,
                     **kwargs
@@ -2638,101 +3362,108 @@ class DocumentProcessor:
                     result['output_path'] = basic_output_path
                 
                 # Handle sorting if enabled
-                if sort and rename_script_path:
-                    try:
-                        # Get thread-local OpenAI client
+                try:
+                    # First, check what type of provider we have
+                    is_openai_client = False
+                    if llm_provider is None:
+                        # Fall back to local Ollama
                         openai_client = get_openai_client()
-                        
-                        # Get metadata from Ollama server using improved function that handles multiple formats
+                        is_openai_client = True
                         metadata_content = send_to_ollama_server(text, input_file, openai_client)
-                        if metadata_content:
-                            # Parse metadata with improved parser supporting multiple formats
-                            metadata = parse_metadata(metadata_content)
-                            if metadata:
-                                # Process author names with improved function that handles multiple formats
-                                author = metadata['author']
-                                logging.debug(f"Extracted author: {author}")
-                                
-                                # Check if author is a single word, if so, add "Unknown" as firstname
-                                author_parts = author.split()
-                                if len(author_parts) == 1:
-                                    author = f"{author} Unknown"
-                                    logging.info(f"Adding 'Unknown' to single word author: {author_parts[0]} -> {author}")
-                                    metadata['author'] = author
-
+                    else:
+                        # Use the provided LLM provider
+                        metadata_content = send_to_llm(text, input_file, llm_provider, 
+                                                    temperature=temperature,
+                                                    max_tokens=max_tokens)
+                    
+                    if metadata_content:
+                        # Parse metadata with improved parser
+                        metadata = parse_metadata(metadata_content)
+                        if metadata:
+                            # Process author names
+                            author = metadata['author']
+                            logging.debug(f"extracted author: {author}")
+                            
+                            # Use appropriate method for author name sorting
+                            if is_openai_client:
                                 corrected_author = sort_author_names(author, openai_client)
-                                logging.debug(f"Corrected author: {corrected_author}")
-                                metadata['author'] = corrected_author
-                                
-                                # Get file details
-                                title = metadata['title']
-                                year = metadata.get('year', 'Unknown')
-                                
-                                # Validate and fix year with new helper function
-                                year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
-                                
-                                # Get language if available
-                                language = metadata.get('language', 'en')
-                                
-                                # Validate essential metadata
-                                if not corrected_author or corrected_author == "UnknownAuthor" or not title:
-                                    logging.warning(f"Missing author or title for {input_file}. Skipping rename.")
-                                    with file_lock:
-                                        with open("unparseables.lst", "a") as unparseable_file:
-                                            unparseable_file.write(f"{input_file} - Missing metadata: Author='{corrected_author}', Title='{title}'\n")
-                                            unparseable_file.flush()
-                                    counters['sort_failed'] += 1
-                                else:
-                                    # Create target paths with sanitized names
-                                    first_author = sanitize_filename(corrected_author)
-                                    sanitized_title = sanitize_filename(title)
-                                    target_dir = os.path.join(os.path.dirname(input_file), first_author)
-                                    file_extension = os.path.splitext(input_file)[1].lower()
-                                    
-                                    # Create filename with appropriate formatting
-                                    # Handle non-English files with language code
-                                    if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
-                                        # Extract just the base extension without dot
-                                        base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
-                                        # Add language code before extension
-                                        new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
-                                    else:
-                                        new_filename = f"{year} {sanitized_title}{file_extension}"
-                                    
-                                    logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
-                                    
-                                    # Add rename command with improved function
-                                    add_rename_command(
-                                        rename_script_path,
-                                        source_path=input_file,
-                                        target_dir=target_dir,
-                                        new_filename=new_filename,
-                                        output_dir=os.path.dirname(output_path) if output_path else None
-                                    )
-                                    
-                                    result['metadata'] = metadata
-                                    counters['sorted'] += 1
                             else:
-                                logging.warning(f"Failed to parse metadata for {input_file}")
+                                corrected_author = sort_author_names(author, llm_provider, 
+                                                                temperature=temperature,
+                                                                max_tokens=max_tokens)
+                            
+                            logging.debug(f"corrected author: {corrected_author}")
+                            metadata['author'] = corrected_author
+                                
+                            # Get file details
+                            title = metadata['title']
+                            year = metadata.get('year', 'Unknown')
+                            
+                            # Validate and fix year with new helper function
+                            year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
+                            
+                            # Get language if available
+                            language = metadata.get('language', 'en')
+                            
+                            # Validate essential metadata
+                            if not corrected_author or corrected_author == "UnknownAuthor" or not title:
+                                logging.warning(f"Missing author or title for {input_file}. Skipping rename.")
                                 with file_lock:
                                     with open("unparseables.lst", "a") as unparseable_file:
-                                        unparseable_file.write(f"{input_file} - Failed to parse metadata format: {metadata_content[:100]}...\n")
+                                        unparseable_file.write(f"{input_file} - Missing metadata: Author='{corrected_author}', Title='{title}'\n")
                                         unparseable_file.flush()
                                 counters['sort_failed'] += 1
+                            else:
+                                # Create target paths with sanitized names
+                                first_author = sanitize_filename(corrected_author)
+                                sanitized_title = sanitize_filename(title)
+                                target_dir = os.path.join(os.path.dirname(input_file), first_author)
+                                file_extension = os.path.splitext(input_file)[1].lower()
+                                
+                                # Create filename with appropriate formatting
+                                # Handle non-English files with language code
+                                if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
+                                    # Extract just the base extension without dot
+                                    base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
+                                    # Add language code before extension
+                                    new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
+                                else:
+                                    new_filename = f"{year} {sanitized_title}{file_extension}"
+                                
+                                logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
+                                
+                                # Add rename command with improved function
+                                add_rename_command(
+                                    rename_script_path,
+                                    source_path=input_file,
+                                    target_dir=target_dir,
+                                    new_filename=new_filename,
+                                    output_dir=os.path.dirname(output_path) if output_path else None
+                                )
+                                
+                                result['metadata'] = metadata
+                                counters['sorted'] += 1
                         else:
-                            logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
+                            logging.warning(f"Failed to parse metadata for {input_file}")
                             with file_lock:
                                 with open("unparseables.lst", "a") as unparseable_file:
-                                    unparseable_file.write(f"{input_file} - Failed to get metadata from Ollama server\n")
+                                    unparseable_file.write(f"{input_file} - Failed to parse metadata format: {metadata_content[:100]}...\n")
                                     unparseable_file.flush()
                             counters['sort_failed'] += 1
-                    except Exception as sort_e:
-                        logging.error(f"Error sorting file {input_file}: {sort_e}")
+                    else:
+                        logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
                         with file_lock:
                             with open("unparseables.lst", "a") as unparseable_file:
-                                unparseable_file.write(f"{input_file} - Error during sorting: {str(sort_e)}\n")
+                                unparseable_file.write(f"{input_file} - Failed to get metadata from Ollama server\n")
                                 unparseable_file.flush()
                         counters['sort_failed'] += 1
+                except Exception as sort_e:
+                    logging.error(f"Error sorting file {input_file}: {sort_e}")
+                    with file_lock:
+                        with open("unparseables.lst", "a") as unparseable_file:
+                            unparseable_file.write(f"{input_file} - Error during sorting: {str(sort_e)}\n")
+                            unparseable_file.flush()
+                    counters['sort_failed'] += 1
                 
                 # Extract tables if requested (only for PDFs)
                 if extract_tables and input_file.lower().endswith('.pdf'):
@@ -3129,8 +3860,6 @@ def parse_metadata(content, verbose=False):
         
     return {'author': author, 'year': year, 'title': title, 'language': language}
 
-
-
 def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose=False):
     """
     Query the Ollama server to extract author, year, title, and language with exponential backoff.
@@ -3145,7 +3874,7 @@ def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose
     prompt_templates = [
         # First attempt - simple structured format
         (
-            f"Extract the full author name (Lastname Surname) of the main author, "
+            f"Extract the main author name (Lastname Surname), "
             f"year of publication, title, and language from the following text, considering the filename '{os.path.basename(filename)}' "
             f"which may contain clues. I need the output **only** in the following format with no additional text or explanations: \n"
             f"<TITLE>The publication title</TITLE>\n<YEAR>2023</YEAR>\n<AUTHOR>Lastname Surname</AUTHOR>\n<LANGUAGE>en</LANGUAGE>\n\n"
@@ -3269,10 +3998,19 @@ def initialize_rename_scripts(rename_script_path):
         'batch_script': batch_script_path if create_batch else None
     }
 
-def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False):
+def sort_author_names(author_names, provider, temperature: float = 0.3, 
+                    max_tokens: int = 100, max_attempts: int = 5, 
+                    verbose: bool = False):
     """
     Format author names into 'Lastname Firstname' format using LLM with backoff.
-    Properly handles author names with commas.
+    
+    Args:
+        author_names: Author names to format
+        provider: LLM provider instance or OpenAI client
+        temperature: Temperature setting for generation
+        max_tokens: Maximum tokens to generate
+        max_attempts: Maximum retry attempts
+        verbose: Whether to print debug info
     """
     if not author_names or author_names.strip() in ["Unknown", "UnknownAuthor", "n a", ""]:
         return "UnknownAuthor"
@@ -3315,7 +4053,9 @@ def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False
         # We have at least two parts, might be good enough
         return formatted_author_names
     
-    # It's a single word, we need to consult the LLM
+    # Determine if we're using OpenAI client for Ollama or an LLM provider
+    is_openai_client = hasattr(provider, 'chat') and hasattr(provider.chat, 'completions')
+    
     # Use LLM to get the correct format with retries
     base_retry_wait = 2  # Base wait time in seconds
     for attempt in range(1, max_attempts + 1):
@@ -3348,16 +4088,25 @@ def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False
         messages = [{"role": "user", "content": prompt}]
         
         # Use the semaphore to limit concurrent requests
-        with ollama_semaphore:
+        with llm_semaphore:
             try:
-                response = openai_client.chat.completions.create(
-                    model=MODEL_NAME,
-                    temperature=0.3,  # Lower temperature for more consistent formatting
-                    max_tokens=100,  # Reduced token count for efficiency
-                    messages=messages
-                )
-                
-                reformatted_name = response.choices[0].message.content.strip()
+                if is_openai_client:
+                    # Using OpenAI client for Ollama
+                    response = provider.chat.completions.create(
+                        model=MODEL_NAME,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        messages=messages
+                    )
+                    reformatted_name = response.choices[0].message.content.strip()
+                else:
+                    # Using an LLM provider instance
+                    response = provider.chat_completion(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                    reformatted_name = response["content"]
                 
                 # Check for tag issues and fix them
                 if "<AUTHOR>" not in reformatted_name:
@@ -3391,7 +4140,7 @@ def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False
                     wait_time = base_retry_wait * (2 ** (attempt - 1))
                     logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
                 else:
-                    logging.error(f"Error querying Ollama server for author names: {e}")
+                    logging.error(f"Error querying LLM for author names: {e}")
                     wait_time = base_retry_wait * (1.5 ** (attempt - 1))
                     logging.info(f"Retrying in {wait_time:.2f} seconds...")
                 
@@ -3411,6 +4160,28 @@ def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False
     # Last resort - just return the original name
     return formatted_author_names
 
+def extract_metadata(text, filename, llm_provider):
+    """
+    Extract metadata using the provided LLM provider
+    
+    Args:
+        text: Text to analyze
+        filename: Filename for context
+        llm_provider: Either an OpenAI client for Ollama or an LLMProvider instance
+    
+    Returns:
+        str: The metadata response
+    """
+    # Check if we're using OpenAI client for Ollama or an LLM provider
+    is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
+    
+    if is_openai_client:
+        # Using OpenAI client for Ollama
+        return send_to_ollama_server(text, filename, llm_provider)
+    else:
+        # Using an LLM provider instance
+        return send_to_llm(text, filename, llm_provider)
+    
 def extract_year_from_filename(filename):
     """
     Try to extract a year (4 digits between 1500-2030) from a filename.
@@ -3608,6 +4379,124 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
         'new_path': os.path.join(target_dir, new_filename)
     }
 
+def detect_language(text, min_text_length=100, max_sample_length=1000, verbose=False):
+    """
+    Detect language of text using multiple fallback methods.
+    
+    Args:
+        text: Text to analyze
+        min_text_length: Minimum text length to attempt detection
+        max_sample_length: Maximum sample length to use
+        verbose: Whether to print debug information
+    
+    Returns:
+        str: ISO 639-1 two-letter language code (e.g., 'en', 'de', 'fr') or None if detection fails
+    """
+    if not text or len(text.strip()) < min_text_length:
+        if verbose:
+            print(f"Text too short for reliable language detection ({len(text) if text else 0} chars)")
+        return None
+    
+    # Use a sample of text to avoid processing very large documents
+    sample = text[:max_sample_length].strip()
+    
+    # Try langdetect first (fastest and most reliable)
+    try:
+        from langdetect import detect, DetectorFactory, LangDetectException
+        # Make detection deterministic
+        DetectorFactory.seed = 0
+        try:
+            return detect(sample)
+        except LangDetectException as e:
+            if verbose:
+                print(f"langdetect failed: {str(e)}")
+    except ImportError:
+        if verbose:
+            print("langdetect not available")
+    
+    # Try langid second (good balance of speed and accuracy)
+    try:
+        import langid
+        lang, _ = langid.classify(sample)
+        return lang
+    except ImportError:
+        if verbose:
+            print("langid not available")
+    
+    # Try cld3 third (neural network-based, good for short text)
+    try:
+        import cld3
+        prediction = cld3.get_language(sample)
+        if prediction.is_reliable:
+            return prediction.language
+    except ImportError:
+        if verbose:
+            print("cld3 not available")
+    
+    # Final fallback: check for common language patterns
+    return _fallback_detect_language(sample)
+
+def _fallback_detect_language(text):
+    """
+    Very basic fallback language detection based on character patterns.
+    Only detects a few common languages with distinctive characters.
+    
+    Args:
+        text: Text to analyze
+        
+    Returns:
+        str: ISO 639-1 language code or None
+    """
+    # Count characters in specific Unicode ranges
+    counts = {
+        'en': 0,  # English/Latin
+        'zh': 0,  # Chinese
+        'ja': 0,  # Japanese
+        'ko': 0,  # Korean
+        'ru': 0,  # Russian/Cyrillic
+        'ar': 0,  # Arabic
+        'de': 0,  # German
+    }
+    
+    # Common German words that help distinguish from English
+    german_words = ['der', 'die', 'das', 'und', 'ist', 'von', 'zu', 'mit', 'sich', 'auf', 'für', 'ein', 'eine']
+    german_word_count = sum(1 for word in text.lower().split() if word in german_words)
+    
+    for char in text:
+        # Chinese characters
+        if '\u4e00' <= char <= '\u9fff':
+            counts['zh'] += 1
+        # Japanese-specific characters (Hiragana & Katakana)
+        elif '\u3040' <= char <= '\u30ff':
+            counts['ja'] += 1
+        # Korean Hangul
+        elif '\uac00' <= char <= '\ud7a3':
+            counts['ko'] += 1
+        # Russian/Cyrillic
+        elif '\u0400' <= char <= '\u04ff':
+            counts['ru'] += 1
+        # Arabic
+        elif '\u0600' <= char <= '\u06ff':
+            counts['ar'] += 1
+        # Latin alphabet (English, German, etc.)
+        elif 'a' <= char.lower() <= 'z':
+            counts['en'] += 1
+    
+    # Adjust for German if we see German-specific words
+    if german_word_count > 5 and counts['en'] > 0:
+        return 'de'
+    
+    # Return the language with the most character matches
+    if any(counts.values()):
+        # Get the language with highest count, excluding English initially
+        non_latin = {k: v for k, v in counts.items() if k != 'en'}
+        if non_latin and max(non_latin.values()) > 0:
+            return max(non_latin.items(), key=lambda x: x[1])[0]
+        # If no non-Latin characters detected, return English
+        return 'en'
+    
+    return None
+
 def escape_special_chars(filename):
     """
     Safely escape special characters in filenames for shell commands.
@@ -3623,11 +4512,18 @@ def get_openai_client():
     """Initialize or return thread-local OpenAI client for Ollama"""
     if not hasattr(thread_local, "client"):
         try:
+            # Import within the function to ensure it's available
+            from openai import OpenAI
+            
             thread_local.client = OpenAI(
                 base_url="http://localhost:11434/v1/",
                 api_key="ollama"
             )
             logging.debug("OpenAI client initialized successfully for thread.")
+        except ImportError as e:
+            logging.critical(f"OpenAI client not available: {e}")
+            logging.critical("Please install the OpenAI client: pip install openai")
+            raise
         except Exception as e:
             logging.critical(f"Failed to initialize OpenAI client in thread: {e}")
             raise
@@ -3699,6 +4595,13 @@ def main():
         '-p', '--password',
         help="Password for encrypted documents"
     )
+
+    parser.add_argument(
+        '--ocr-method',
+        choices=['auto', 'tesseract', 'doctr', 'easyocr', 'kraken'],
+        default='auto',
+        help="Preferred OCR method when text extraction is needed"
+    )
     
     parser.add_argument(
         '-t', '--tables',
@@ -3728,7 +4631,39 @@ def main():
         action='store_true',
         help="Process files even if output text file already exists"
     )
+
+    # Add to the argument parser in main()
+    parser.add_argument(
+        '--llm-provider',
+        choices=['ollama', 'groq', 'cohere', 'openai', 'glhf', 'huggingface'],
+        default='ollama',
+        help="LLM provider to use for metadata extraction (default: ollama)"
+    )
+
+    parser.add_argument(
+        '--llm-model',
+        help="Model name to use with the LLM provider"
+    )
+
+    parser.add_argument(
+        '--api-key',
+        help="API key for cloud LLM providers (Groq, Poe)"
+    )
     
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.5,
+        help="Temperature setting for LLM generation (0.0-1.0)"
+    )
+    
+    parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=250,
+        help="Maximum tokens in LLM response"
+    )
+
     args = parser.parse_args()
     
     # Configure logging
@@ -3777,45 +4712,52 @@ def main():
         
         # Initialize Ollama client and rename script if sorting is enabled
         openai_client = None
+        llm_provider = None
         rename_script_path = None
         
         if args.sort:
             try:
-                # Check if OpenAI client is available
-                try:
-                    from openai import OpenAI
-                    OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
-                    #openai_client = get_openai_client()
-                    logging.info("OpenAI client for Ollama is available")
-                except ImportError:
-                    logging.error("OpenAI client not available. Install with 'pip install openai'")
-                    logging.error("Proceeding without sorting functionality")
-                    args.sort = False
-                except Exception as e:
-                    logging.error(f"Error initializing OpenAI client: {e}")
-                    logging.error("Proceeding without sorting functionality")
-                    args.sort = False
-                    
-                if args.sort:  # Check again in case we disabled it due to import error
+                if args.llm_provider == "ollama":
+                    # For Ollama, we keep the existing behavior
+                    try:
+                        from openai import OpenAI
+                        OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
+                        logging.info("OpenAI client for Ollama is available")
+                    except ImportError:
+                        logging.error("OpenAI client not available. Install with 'pip install openai'")
+                        logging.error("Proceeding without sorting functionality")
+                        args.sort = False
+                    except Exception as e:
+                        logging.error(f"Error initializing OpenAI client: {e}")
+                        logging.error("Proceeding without sorting functionality")
+                        args.sort = False
+                else:
+                    # For other providers, use the new provider factory
+                    try:
+                        llm_provider = get_llm_provider(
+                            provider_type=args.llm_provider,
+                            model_name=args.llm_model,
+                            api_key=args.api_key
+                        )
+                        logging.info(f"Initialized {args.llm_provider} LLM provider")
+                    except ImportError as e:
+                        logging.error(f"Required libraries not available for {args.llm_provider}: {e}")
+                        logging.error("Proceeding without sorting functionality")
+                        args.sort = False
+                    except Exception as e:
+                        logging.error(f"Error initializing LLM provider: {e}")
+                        logging.error("Proceeding without sorting functionality")
+                        args.sort = False
+                
+                if args.sort:  # Check again in case we disabled it due to errors
                     # Initialize rename script
                     rename_script_path = args.rename_script
                     script_paths = initialize_rename_scripts(rename_script_path)
-                
-                    if platform.system() == 'Windows':
-                        logging.info(f"Initialized rename scripts at {script_paths['bash_script']} and {script_paths['batch_script']}")
-                    else:
-                        logging.info(f"Initialized rename script at {script_paths['bash_script']}")
-                    
-                    # Clean or create unparseables list
-                    with open("unparseables.lst", "w") as unparseable_file:
-                        unparseable_file.write("# Files that couldn't be parsed properly\n")
-                        unparseable_file.flush()
             except Exception as e:
                 logging.error(f"Error initializing sorting functionality: {e}")
-                logging.error("Proceeding without sorting functionality")
                 args.sort = False
-                #openai_client = None
-                #rename_script_path = None
+                llm_provider = None
+                rename_script_path = None
         
         try:
             # Process files with periodic shutdown checks
@@ -3827,12 +4769,16 @@ def main():
                 input_files,
                 output_dir=args.output_dir,
                 method=args.method,
+                ocr_method=args.ocr_method,
                 password=args.password,
                 extract_tables=args.tables,
                 max_workers=args.workers,
                 noskip=args.noskip,
                 sort=args.sort,                     # sorting parameter
-                rename_script_path=rename_script_path  # sorting parameter
+                rename_script_path=rename_script_path,  # sorting parameter
+                llm_provider=llm_provider,
+                temperature=args.temperature,     
+                max_tokens=args.max_tokens,        
             )
             
             # Handle results

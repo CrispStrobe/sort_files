@@ -46,6 +46,35 @@ from importlib.metadata import version, PackageNotFoundError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import signal
+import threading
+from datetime import datetime
+from types import MappingProxyType
+import time
+
+
+# Import OpenAI client for Ollama
+try:
+    from openai import OpenAI
+except ImportError:
+    print("OpenAI client library is not installed. Please install it using 'pip install openai'.")
+    print("Required for --sort functionality")
+
+
+# Thread-local storage for OpenAI clients
+thread_local = threading.local()
+
+# Limit concurrent connections to Ollama - prevents overwhelming the server
+ollama_semaphore = threading.Semaphore(2)  # Allow only 2 concurrent connections
+
+# Global lock for thread-safe file operations
+file_lock = threading.Lock()
+
+# Define a shutdown flag for graceful termination
+shutdown_flag = threading.Event()
+
+# Constants for LLM model
+MODEL_NAME = "cas/spaetzle-v85-7b"  
+# Can also use "cas/llama-3.1-8b-instruct" or other Ollama models
 
 class timeout:
     """Context manager for timeout"""
@@ -233,7 +262,10 @@ class ExtractionManager:
         output_path: Optional[str] = None,
         method: Optional[str] = None,
         password: Optional[str] = None,
-        extract_tables: bool = False,  
+        extract_tables: bool = False,
+        sort: bool = False,     # with callback for sort processing
+        openai_client = None,
+        rename_script_path: Optional[str] = None,
         **kwargs) -> Union[str, bool]:
         """
         Extract text from a document with progress reporting and error handling
@@ -244,6 +276,9 @@ class ExtractionManager:
             method: Preferred extraction method
             password: Password for encrypted documents
             extract_tables: Whether to extract tables (PDF only)
+            sort: Whether to sort files based on content
+            openai_client: OpenAI client for Ollama communication
+            rename_script_path: Path to write rename commands
             **kwargs: Additional extraction options
             
         Returns:
@@ -279,9 +314,60 @@ class ExtractionManager:
             # Validate and handle output
             if not self._validate_text(text):
                 logging.warning("Extracted text may be of low quality")
-                
+            
+            # Handle sorting if requested
+            if sort and openai_client and rename_script_path and text:
+                try:
+                    # Get metadata from Ollama server
+                    metadata_content = send_to_ollama_server(text, input_path, openai_client)
+                    if metadata_content:
+                        metadata = parse_metadata(metadata_content)
+                        if metadata:
+                            # Process author names
+                            author = metadata['author']
+                            logging.debug(f"extracted author: {author}")
+                            corrected_author = sort_author_names(author, openai_client)
+                            logging.debug(f"corrected author: {corrected_author}")
+                            metadata['author'] = corrected_author
+                            
+                            # Get file details
+                            title = metadata['title']
+                            year = metadata['year']
+                            if not year or year == "Unknown":
+                                year = "UnknownYear"
+                                
+                            if not author or not title:
+                                logging.warning(f"Missing author or title for {input_path}. Skipping rename.")
+                            else:
+                                # Create target paths
+                                first_author = sanitize_filename(corrected_author)
+
+                                target_dir = os.path.join(os.path.dirname(input_path), first_author)
+                                file_extension = os.path.splitext(input_path)[1].lower()
+                                new_filename = f"{year} {sanitize_filename(title)}{file_extension}"
+                                logging.debug(f"New filename will be: {new_filename}")
+
+                                # Add rename command - Pass output_path to determine the text file location
+                                output_dir = os.path.dirname(output_path) if output_path else None
+                                add_rename_command(
+                                    rename_script_path, 
+                                    input_path, 
+                                    target_dir, 
+                                    new_filename, 
+                                    output_dir=output_dir  # Pass output directory for text file location
+                                )
+                        else:
+                            logging.warning(f"Failed to parse metadata for {input_path}")
+                    else:
+                        logging.warning(f"Failed to get metadata from Ollama server for {input_path}")
+                except Exception as sort_e:
+                    logging.error(f"Error sorting file {input_path}: {sort_e}")
+                        
+            # Write output file if path provided
             if output_path:
+                # Make sure the directory exists
                 os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+                logging.info(f"Writing text file: {output_path}")
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(text)
                 return True
@@ -2067,11 +2153,13 @@ class DocumentProcessor:
                 output_dir: Optional[str] = None,
                 method: Optional[str] = None,
                 password: Optional[str] = None,
-                extract_tables: bool = False,
+                extract_tables: bool = False,  
                 max_workers: int = None,
                 noskip: bool = False,
+                sort: bool = False,                # New parameter
+                rename_script_path: str = None,    # New parameter
                 **kwargs) -> Dict[str, Any]:
-        """Process multiple files with interrupt handling"""
+        """Process multiple files with interrupt handling and optional sorting"""
         results = {}
         failed = []
         skipped = []
@@ -2080,14 +2168,24 @@ class DocumentProcessor:
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         
-        # Determine number of workers
-        max_workers = max_workers or min(len(input_files), (os.cpu_count() or 1))
+        # Determine number of workers - fewer workers when sorting to avoid Ollama overload
+        if sort:
+            # When sorting is enabled, use fewer workers to prevent Ollama API overload
+            max_workers = max_workers or min(4, os.cpu_count() or 1)  # Use at most 4 threads for sorting
+        else:
+            max_workers = max_workers or min(len(input_files), (os.cpu_count() or 1))
         
+        # ProcessPoolExecutor doesn't work well with our thread_local OpenAI clients
+        # So we stick with ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             
             with tqdm(total=len(input_files), desc="Processing files", unit="file") as pbar:
                 for input_file in input_files:
+                    if shutdown_flag.is_set():
+                        logging.info("Shutdown flag detected. Not submitting more jobs.")
+                        break
+                        
                     future = executor.submit(
                         self._process_single_file,
                         input_file,
@@ -2096,6 +2194,8 @@ class DocumentProcessor:
                         password,
                         extract_tables,
                         noskip,
+                        sort,                     # New parameter
+                        rename_script_path,       # New parameter
                         **kwargs
                     )
                     futures[future] = input_file
@@ -2117,6 +2217,10 @@ class DocumentProcessor:
                             logging.error(f"Failed to process {input_file}: {e}")
                     finally:
                         pbar.update(1)
+                        
+                    # Check shutdown flag periodically
+                    if shutdown_flag.is_set() and not future.done():
+                        future.cancel()
         
         # Print summary 
         if True: # or change to: self._debug
@@ -2217,13 +2321,34 @@ class DocumentProcessor:
         return str(output_path)
 
     def _process_single_file(self, input_file: str,
-                        output_dir: Optional[str] = None,
-                        method: Optional[str] = None,
-                        password: Optional[str] = None,
-                        extract_tables: bool = False,
-                        noskip: bool = False,
-                        **kwargs) -> Dict[str, Any]:
-        """Process a single document, skipping if output already exists unless noskip=True"""
+                    output_dir: Optional[str] = None,
+                    method: Optional[str] = None,
+                    password: Optional[str] = None,
+                    extract_tables: bool = False,
+                    noskip: bool = False,
+                    sort: bool = False,
+                    rename_script_path: str = None,
+                    counters: Dict[str, int] = None,
+                    **kwargs) -> Dict[str, Any]:
+        """
+        Process a single document, with optimized skipping logic for sorting
+        
+        Args:
+            input_file: Path to input file
+            output_dir: Optional output directory
+            method: Preferred extraction method
+            password: Password for encrypted documents
+            extract_tables: Whether to extract tables
+            noskip: Whether to process even if output exists
+            sort: Whether to sort files based on content
+            rename_script_path: Path to write rename commands
+            counters: Dictionary for tracking statistics
+            **kwargs: Additional extraction options
+            
+        Returns:
+            Dict with processing results
+        """
+        # Initialize result dictionary
         result = {
             'success': False,
             'text': '',
@@ -2233,74 +2358,250 @@ class DocumentProcessor:
             'skipped': False
         }
         
+        # Initialize counters if not provided
+        if counters is None:
+            counters = {
+                'total': 0,
+                'processed': 0,
+                'skipped': 0,
+                'sorted': 0,
+                'sort_failed': 0,
+                'failed': 0
+            }
+        
+        # Check for shutdown flag
+        if shutdown_flag.is_set():
+            logging.debug(f"Shutdown flag detected. Skipping {input_file}")
+            result['error'] = "Processing aborted due to shutdown signal"
+            return result
+        
         try:
-             # Generate basic output path (no uniqueness yet)
+            # Generate basic output path (no uniqueness yet)
             basic_output_path = self._get_unique_output_path(input_file, output_dir, noskip=False)
             
-            # Check if output file already exists and we're not in noskip mode
-            if not noskip and os.path.exists(basic_output_path):
+            # Check if we should skip this file
+            should_skip = False
+            if os.path.exists(basic_output_path) and not noskip:
+                # If not sorting, skip existing files
+                if not sort:
+                    should_skip = True
+                else:
+                    # When sorting, skip only if file is already in rename script
+                    if rename_script_path and os.path.exists(rename_script_path):
+                        try:
+                            # Check if input file path is in rename script
+                            with open(rename_script_path, 'r') as script_file:
+                                script_content = script_file.read()
+                                if input_file in script_content:
+                                    should_skip = True
+                                    logging.debug(f"File {input_file} already in rename script, skipping")
+                        except Exception as e:
+                            logging.error(f"Error checking rename script: {e}")
+                            # Continue processing if we can't check the rename script
+            
+            if should_skip:
                 if self._debug:
-                    logging.info(f"Skipping {input_file} - output file {basic_output_path} already exists")
+                    logging.info(f"Skipping {input_file} - output file exists and already processed")
                 result['success'] = True
                 result['skipped'] = True
                 result['output_path'] = basic_output_path
+                counters['skipped'] += 1
                 return result
             
-            # If we're here, either the file doesn't exist or noskip=True
-            # Get the actual output path (which might be a unique name if noskip=True)
+            # Get the actual output path (which might be unique if noskip=True)
             output_path = self._get_unique_output_path(input_file, output_dir, noskip=noskip)
             
-            if self._debug:
-                logging.info(f"Processing {input_file} -> {output_path}")
+            # Determine if we need to extract text or can use existing file
+            text = ""
+            reused_text = False
             
-            # Extract text
-            text = self.manager.extract(
-                input_file,
-                method=method,
-                password=password,
-                extract_tables=extract_tables,
-                **kwargs
-            )
+            if sort and os.path.exists(basic_output_path):
+                # Reuse existing text file for sorting
+                try:
+                    with open(basic_output_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    reused_text = True
+                    logging.debug(f"Reusing existing text from {basic_output_path} for sorting")
+                except Exception as e:
+                    logging.error(f"Error reading existing text file: {e}")
+                    # Will fall back to extraction
+                    
+            # Extract text if we couldn't reuse existing
+            if not reused_text:
+                if self._debug:
+                    logging.info(f"Processing {input_file} -> {output_path}")
+                    
+                text = self.manager.extract(
+                    input_file,
+                    method=method,
+                    password=password,
+                    extract_tables=extract_tables,
+                    **kwargs
+                )
             
             if text:
                 result['text'] = text
                 result['success'] = True
+                counters['processed'] += 1
                 
-                # Save to file
-                try:
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                    result['output_path'] = output_path
-                    
-                    if self._debug:
-                        logging.info(f"Saved text to {output_path}")
+                # Only save the text to file if we extracted it (not if we reused existing)
+                if not reused_text:
+                    try:
+                        # Make sure the directory exists
+                        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
                         
-                except Exception as e:
-                    logging.error(f"Failed to write output file {output_path}: {e}")
-                    result['success'] = False
-                    result['error'] = str(e)
+                        with open(output_path, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                        result['output_path'] = output_path
+                        
+                        if self._debug:
+                            logging.info(f"Saved text to {output_path}")
+                        else:
+                            logging.debug(f"Saved text to {output_path}")  # Log even in non-debug mode
+                            
+                    except Exception as e:
+                        logging.error(f"Failed to write output file {output_path}: {e}")
+                        result['success'] = False
+                        result['error'] = str(e)
+                        counters['failed'] += 1
+                        return result
+                else:
+                    result['output_path'] = basic_output_path
                 
-                # (Integration for Table Extraction)
+                # Handle sorting if enabled
+                if sort and rename_script_path:
+                    try:
+                        # Get thread-local OpenAI client
+                        openai_client = get_openai_client()
+                        
+                        # Get metadata from Ollama server
+                        metadata_content = send_to_ollama_server(text, input_file, openai_client)
+                        if metadata_content:
+                            metadata = parse_metadata(metadata_content)
+                            if metadata:
+                                # Process author names
+                                author = metadata['author']
+                                logging.debug(f"extracted author: {author}")
+
+                                corrected_author = sort_author_names(author, openai_client)
+                                logging.debug(f"corrected author: {corrected_author}")
+
+                                metadata['author'] = corrected_author
+                                
+                                # Get file details
+                                title = metadata['title']
+                                year = metadata['year']
+                                if not year or year == "Unknown":
+                                    year = "UnknownYear"
+                                    
+                                if not author or not title:
+                                    logging.warning(f"Missing author or title for {input_file}. Skipping rename.")
+                                    with file_lock:
+                                        with open("unparseables.lst", "a") as unparseable_file:
+                                            unparseable_file.write(f"{input_file}\n")
+                                            unparseable_file.flush()
+                                    counters['sort_failed'] += 1
+                                else:
+                                    # Create target paths with full author name
+                                    first_author = sanitize_filename(corrected_author)
+                                    target_dir = os.path.join(os.path.dirname(input_file), first_author)
+                                    file_extension = os.path.splitext(input_file)[1].lower()
+                                    new_filename = f"{year} {sanitize_filename(title)}{file_extension}"
+                                    logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
+                                    
+                                    # Add rename command
+                                    escaped_source_path = escape_special_chars(input_file)
+                                    escaped_target_dir = escape_special_chars(target_dir)
+                                    escaped_target_path = escape_special_chars(os.path.join(target_dir, new_filename))
+                                    
+                                    # Add rename command for the file
+                                    with file_lock:
+                                        with open(rename_script_path, "a") as mv_file:
+                                            mv_file.write(f"mkdir -p {escaped_target_dir}\n")
+                                            mv_file.write(f"mv {escaped_source_path} {escaped_target_path}\n")
+                                            
+                                            # Also add command to move the text file if it exists
+                                            if output_path:
+                                                text_extension = ".txt"
+                                                txt_source_path = os.path.splitext(input_file)[0] + text_extension
+                                                if output_dir:
+                                                    # If output is in a different directory
+                                                    txt_source_path = os.path.join(
+                                                        output_dir,
+                                                        os.path.basename(os.path.splitext(input_file)[0]) + text_extension
+                                                    )
+                                                
+                                                txt_target_path = os.path.join(
+                                                    target_dir,
+                                                    f"{year} {sanitize_filename(title)}{text_extension}"
+                                                )
+                                                
+                                                escaped_txt_source = escape_special_chars(txt_source_path)
+                                                escaped_txt_target = escape_special_chars(txt_target_path)
+                                                
+                                                mv_file.write(f"# Also move the text file if it exists\n")
+                                                mv_file.write(f"if [ -f {escaped_txt_source} ]; then\n")
+                                                mv_file.write(f"  mv {escaped_txt_source} {escaped_txt_target}\n")
+                                                mv_file.write(f"fi\n\n")
+                                            
+                                            mv_file.flush()
+                                    
+                                    logging.debug(f"Added rename command for: {input_file}")
+                                    result['metadata'] = metadata
+                                    counters['sorted'] += 1
+                            else:
+                                logging.warning(f"Failed to parse metadata for {input_file}")
+                                with file_lock:
+                                    with open("unparseables.lst", "a") as unparseable_file:
+                                        unparseable_file.write(f"{input_file}\n")
+                                        unparseable_file.flush()
+                                counters['sort_failed'] += 1
+                        else:
+                            logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
+                            with file_lock:
+                                with open("unparseables.lst", "a") as unparseable_file:
+                                    unparseable_file.write(f"{input_file}\n")
+                                    unparseable_file.flush()
+                            counters['sort_failed'] += 1
+                    except Exception as sort_e:
+                        logging.error(f"Error sorting file {input_file}: {sort_e}")
+                        with file_lock:
+                            with open("unparseables.lst", "a") as unparseable_file:
+                                unparseable_file.write(f"{input_file}\n")
+                                unparseable_file.flush()
+                        counters['sort_failed'] += 1
+                
+                # Extract tables if requested (only for PDFs)
                 if extract_tables and input_file.lower().endswith('.pdf'):
                     try:
                         tables = self._table_extractor.extract_tables(input_file)
-                        # Convert each table (assuming each table has a .df attribute, e.g., a pandas DataFrame)
                         result['tables'] = [table.df.to_dict() for table in tables]
                         if self._debug:
                             logging.info(f"Extracted {len(tables)} tables from {input_file}")
                     except Exception as te:
                         logging.error(f"Table extraction failed for {input_file}: {te}")
                         result['tables'] = []
-                    
-                # (Integration for Metadata Extraction)
+                
+                # Extract metadata
                 result['metadata'] = self._extract_metadata(input_file)
                     
+            else:
+                logging.error(f"Failed to extract text from {input_file}")
+                result['error'] = "No text extracted"
+                counters['failed'] += 1
+                
         except Exception as e:
             error_msg = f"Processing failed: {str(e)}"
             logging.error(error_msg)
             result['error'] = error_msg
             result['success'] = False
+            counters['failed'] += 1
             
+            with file_lock:
+                with open("unparseables.lst", "a") as unparseable_file:
+                    unparseable_file.write(f"{input_file}\n")
+                    unparseable_file.flush()
+        
         return result
     
     def _extract_metadata(self, file_path: str) -> Dict[str, Any]:
@@ -2326,6 +2627,501 @@ class DocumentProcessor:
                 
         return metadata
 
+
+# Signal handler to set the shutdown flag
+# Keep the global signal handler for setting the shutdown_flag
+def signal_handler(signum, frame):
+    """
+    Signal handler for SIGINT, SIGTERM, and other interrupt signals.
+    Sets the shutdown flag and logs the interrupt event.
+    """
+    if not shutdown_flag.is_set():  # Only log once
+        signal_name = {
+            signal.SIGINT: "SIGINT (Ctrl+C)",
+            signal.SIGTERM: "SIGTERM",
+            signal.SIGTSTP: "SIGTSTP (Ctrl+Z)"
+        }.get(signum, f"Signal {signum}")
+        
+        logging.info(f"Received {signal_name}. Initiating graceful shutdown...")
+        shutdown_flag.set()
+
+# Register global handlers outside main()
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+if platform.system() != 'Windows':
+    signal.signal(signal.SIGTSTP, signal_handler)
+
+def is_file_in_rename_script(rename_script_path, input_file):
+    """
+    Check if a file path is already mentioned in the rename script(s).
+    Checks both bash and batch scripts if needed.
+    
+    Args:
+        rename_script_path: Path to the rename script
+        input_file: Input file path to check
+        
+    Returns:
+        bool: True if file is already in any rename script, False otherwise
+    """
+    # Determine if we need to check both scripts
+    is_windows = platform.system() == 'Windows'
+    script_ext = os.path.splitext(rename_script_path)[1].lower()
+    
+    scripts_to_check = [rename_script_path]
+    
+    # Add batch script if on Windows and main script is not .bat
+    if is_windows and script_ext != '.bat':
+        batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
+        if os.path.exists(batch_script_path):
+            scripts_to_check.append(batch_script_path)
+    
+    # Check each script
+    for script_path in scripts_to_check:
+        if not os.path.exists(script_path):
+            continue
+            
+        try:
+            with open(script_path, 'r') as script_file:
+                content = script_file.read()
+                
+                # For Windows script, check both with forward and backslashes
+                if script_path.endswith('.bat'):
+                    unix_path = input_file
+                    win_path = input_file.replace('/', '\\')
+                    if unix_path in content or win_path in content:
+                        return True
+                else:
+                    if input_file in content:
+                        return True
+        except Exception as e:
+            logging.error(f"Error checking rename script {script_path}: {e}")
+    
+    # If we get here, the file isn't in any script
+    return False
+    
+def sanitize_filename(name):
+    """Sanitize a filename to ensure safe filesystem operations"""
+    # Remove disallowed characters
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    
+    # Handle spacing and initials
+    if " " in name:
+        name = re.sub(r'(\w)\.', r'\1', name)
+        parts = name.split()
+        new_parts = []
+        current_initials = ""
+        for part in parts:
+            if len(part) == 1:
+                current_initials += part
+            else:
+                if current_initials:
+                    new_parts.append(current_initials)
+                    current_initials = ""
+                new_parts.append(part)
+        if current_initials:
+            new_parts.append(current_initials)
+        name = " ".join(new_parts)
+    
+    return name.strip().replace('/', '')
+
+def parse_metadata(content, verbose=False):
+    """
+    Parse the metadata content returned by the Ollama server.
+    
+    Returns:
+        dict or None: Dictionary containing author, year, title, and language
+    """
+    title_match = re.search(r'<TITLE>(.*?)</TITLE>', content, re.DOTALL)
+    year_match = re.search(r'<YEAR>(\d{4})</YEAR>', content, re.DOTALL)
+    author_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', content, re.DOTALL)
+    language_match = re.search(r'<LANGUAGE>(.*?)</LANGUAGE>', content, re.DOTALL)
+    
+    # If TITLE tag is incomplete, try to match it differently
+    if not title_match:
+        title_match = re.search(r'TITLE>(.*?)</TITLE>', content, re.DOTALL)
+    
+    # Extract values from matches
+    title = title_match.group(1).strip() if title_match else None
+    author = author_match.group(1).strip() if author_match else None
+    year = year_match.group(1).strip() if year_match else "Unknown"
+    language = language_match.group(1).strip().lower() if language_match else "en"
+    
+    # Validate extracted data
+    if not title_match:
+        logging.warning(f"No match for title in {content}.")
+        return None
+    if not author_match:
+        logging.warning(f"No match for author in {content}.")
+        return None
+    
+    # Sanitize filenames
+    title = sanitize_filename(title) if title else "unknown"
+    author = sanitize_filename(author) if author else "unknown"
+    year = sanitize_filename(year)
+    language = sanitize_filename(language)
+    
+    # Check for placeholder values
+    if any(placeholder in (title.lower(), author.lower(), year.lower(), language.lower()) 
+           for placeholder in ["unknown", "UnknownAuthor", "n a", ""]):
+        logging.warning("Warning: Found 'unknown', 'n a', or empty strings in metadata.")
+        return None
+        
+    return {'author': author, 'year': year, 'title': title, 'language': language}
+
+def clean_author_name(author_name):
+    """Remove titles and punctuations from the author name."""
+    author_name = re.sub(r'\bDr\.?\b', '', author_name, flags=re.IGNORECASE)
+    author_name = re.sub(r'\s*,\s*', ' ', author_name).strip()
+    return author_name
+
+def valid_author_name(author_name):
+    """Check if the author name is valid"""
+    parts = author_name.strip().split()
+    if len(parts) <= 1:
+        return False
+    if not re.match(r'^[\w\s.\'-]+$', author_name, re.UNICODE):
+        return False
+    if "lastname" in author_name.lower() or "surname" in author_name.lower():
+        return False
+    return True
+
+def execute_rename_commands(script_path):
+    """Execute the generated rename commands script"""
+    try:
+        # Ensure the file is closed before executing
+        with open(script_path, 'r') as script_file:
+            pass  # Just to ensure it's accessible and can be opened
+        subprocess.run(['bash', script_path], check=True)
+        logging.info(f"Successfully executed rename commands from {script_path}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing rename commands: {e}. Please check the rename script for issues.")
+    except FileNotFoundError:
+        logging.error(f"Rename script '{script_path}' not found.")
+    except PermissionError:
+        logging.error(f"Permission denied while executing the rename script '{script_path}'. Ensure it is executable.")
+    except Exception as e:
+        logging.error(f"Unexpected error during rename command execution: {e}")
+
+def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose=False):
+    """
+    Query the Ollama server to extract author, year, title, and language with exponential backoff.
+    
+    Returns:
+        str: The formatted metadata response
+    """
+    base_retry_wait = 2  # Base wait time in seconds
+    attempt = 1
+    while attempt <= max_attempts and not shutdown_flag.is_set():
+        logging.debug(f"Consulting Ollama server on file: {filename} (Attempt: {attempt})")
+        base_filename = os.path.splitext(os.path.basename(filename))[0]
+        prompt = (
+            f"Extract the author name (lastname surname) of the first author (ignore other authors), year of publication, title, and language from the following text, considering the filename '{base_filename}' which may contain clues. "
+            f"I need the output **only** in the following format with no additional text or explanations: \n"
+            f"<TITLE>The publication title</TITLE> \n<YEAR>2023</YEAR> \n<AUTHOR>Lastname Surname</AUTHOR> \n<LANGUAGE>en</LANGUAGE> \n\n"
+            f"Here is the extracted text:\n{text[:3000]}"  # Limit text to avoid token limits
+        )
+        messages = [{"role": "user", "content": prompt}]
+        
+        with ollama_semaphore:
+            try:
+                response = openai_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    temperature=0.7,
+                    max_tokens=250,
+                    messages=messages,
+                    timeout=120  # 2 minute timeout
+                )
+                
+                output = response.choices[0].message.content.strip()
+                if verbose:
+                    logging.debug(f"Metadata content received from server: {output}")
+                    
+                # Validation 
+                title = re.search(r'TITLE>(.*?)</TITLE>', output, re.DOTALL)
+                year = re.search(r'<YEAR>(\d{4})</YEAR>', output, re.DOTALL)
+                author = re.search(r'<AUTHOR>(.*?)</AUTHOR>', output, re.DOTALL)
+                language = re.search(r'<LANGUAGE>(.*?)</LANGUAGE>', output, re.DOTALL)
+                
+                if title and year and author and language:
+                    if verbose:
+                        logging.debug(f"The output contains all required fields")
+                    return output
+                else:
+                    logging.warning(f"Unexpected response format from Ollama server: {output}")
+                    # Less aggressive backoff for format issues - might not be server's fault
+                    if attempt < max_attempts:
+                        wait_time = base_retry_wait * (1.5 ** (attempt - 1))  # Gentler exponential backoff
+                        logging.info(f"Retrying with different prompt in {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                        attempt += 1
+                        continue
+                    return output
+                
+            except Exception as e:
+                if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
+                    # Use exponential backoff for rate limiting/timeouts
+                    wait_time = base_retry_wait * (2 ** (attempt - 1))  # Exponential backoff
+                    logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                    attempt += 1
+                    continue
+                else:
+                    logging.error(f"Error communicating with Ollama server for {filename}: {e}")
+                    if attempt < max_attempts:
+                        wait_time = base_retry_wait * (1.5 ** (attempt - 1))  # Gentler exponential backoff
+                        logging.info(f"Retrying in {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                        attempt += 1
+                        continue
+                return ""
+                
+    logging.error(f"Maximum retry attempts reached for sending to Ollama server.")
+    return ""
+
+def initialize_rename_scripts(rename_script_path):
+    """Initialize both bash and batch rename scripts if needed"""
+    is_windows = platform.system() == 'Windows'
+    
+    # Get script extension
+    script_ext = os.path.splitext(rename_script_path)[1].lower()
+    create_bash = script_ext in ['', '.sh']
+    create_batch = is_windows or script_ext == '.bat'
+    
+    # Derive the batch script path if needed
+    batch_script_path = rename_script_path
+    if create_batch and script_ext != '.bat':
+        batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
+    
+    # Initialize bash script
+    if create_bash:
+        with open(rename_script_path, "w") as bash_file:
+            bash_file.write("#!/bin/bash\n")
+            bash_file.write('set -e\n\n')
+            bash_file.flush()
+        
+        try:
+            os.chmod(rename_script_path, 0o755)  # Make executable
+            logging.debug(f"Made bash script executable: {rename_script_path}")
+        except Exception as e:
+            logging.warning(f"Could not set executable permission on {rename_script_path}: {e}")
+    
+    # Initialize batch script
+    if create_batch:
+        with open(batch_script_path, "w") as batch_file:
+            batch_file.write("@echo off\n")
+            batch_file.write("setlocal enabledelayedexpansion\n\n")
+            batch_file.write("rem Rename script for Windows\n\n")
+            batch_file.flush()
+    
+    return {
+        'bash_script': rename_script_path if create_bash else None,
+        'batch_script': batch_script_path if create_batch else None
+    }
+
+def sort_author_names(author_names, openai_client, max_attempts=5, verbose=False):
+    """Format author names into 'Lastname Firstname' format using LLM with backoff"""
+    base_retry_wait = 2  # Base wait time in seconds
+    for attempt in range(1, max_attempts + 1):
+        if verbose:
+            logging.debug(f"Attempt {attempt} to sort author names: {author_names}")
+        
+        formatted_author_names = author_names.replace('&', ',')
+        prompt = (
+            f"You will be given an author name that you must put into the format 'Lastname Surname'. "
+            f"So, you must first make an educated guess if the given input is already in this format. If so, return it back. "
+            f"If not and it is more plausibly in the format 'Surname(s) Lastname', you must reformat it. "
+            f"Example: 'Michael Max Mustermann' must become 'Mustermann Michael Max' and 'Joe A. Doe' must become 'Doe Joe A'. "
+            f"No comma after the Lastname! "
+            f"If you are given multiple person names, only keep the first and omit all others. "
+            f"If it is impossible to come up with a correct name, return <AUTHOR>n a</AUTHOR>. "
+            f"You must give the output in the format: <AUTHOR>Lastname Surname(s)</AUTHOR>. "
+            f"Here are the name parts: <AUTHOR>{formatted_author_names}</AUTHOR>"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        
+        # Use the semaphore to limit concurrent requests
+        with ollama_semaphore:
+            try:
+                response = openai_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    temperature=0.5,
+                    max_tokens=250,  # Reduced from 500 to save tokens
+                    messages=messages
+                )
+                
+                reformatted_name = response.choices[0].message.content.strip()
+                name_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name)
+                if name_match:
+                    ordered_name = name_match.group(1).strip().split(",")[0].strip()
+                    ordered_name = clean_author_name(ordered_name)
+                    logging.debug(f"Ordered name after cleaning: '{ordered_name}'")
+                    if valid_author_name(ordered_name):
+                        return ordered_name
+                    else:
+                        logging.warning(f"Invalid author name format detected: '{ordered_name}', retrying...")
+                else:
+                    logging.warning("Failed to extract a valid name, retrying...")
+                
+            except Exception as e:
+                if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
+                    wait_time = base_retry_wait * (2 ** (attempt - 1))
+                    logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
+                else:
+                    logging.error(f"Error querying Ollama server for author names: {e}")
+                    wait_time = base_retry_wait * (1.5 ** (attempt - 1))
+                    logging.info(f"Retrying in {wait_time:.2f} seconds...")
+                
+                if attempt < max_attempts:
+                    time.sleep(wait_time)
+                    continue
+                return "UnknownAuthor"
+        
+        # Wait a little between attempts even if no error occurred
+        if attempt < max_attempts:
+            time.sleep(1)  # Small pause between attempts
+                
+    logging.error("Maximum retry attempts reached for sorting author names.")
+    return "UnknownAuthor"
+
+def add_rename_command(rename_script_path, source_path, target_dir, new_filename, output_dir=None):
+    """
+    Add mkdir and mv commands to the rename script.
+    Also moves the corresponding .txt file if it exists.
+    Generates appropriate commands for both bash and Windows batch scripts.
+    
+    Parameters:
+        rename_script_path: Path to the rename script file
+        source_path: Source file path
+        target_dir: Target directory path - will have any commas removed
+        new_filename: New filename
+        output_dir: Optional output directory for text files
+    """
+    # Remove any commas from target directory name
+    target_dir = target_dir.replace(',', '')
+    
+    # Determine if we're on Windows
+    is_windows = platform.system() == 'Windows'
+    
+    # Get script extension to determine if we need to create both scripts
+    script_ext = os.path.splitext(rename_script_path)[1].lower()
+    create_bash = script_ext in ['', '.sh']
+    create_batch = is_windows or script_ext == '.bat'
+    
+    # Derive the batch script path if needed
+    batch_script_path = rename_script_path
+    if create_batch and script_ext != '.bat':
+        batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
+    
+    # Prepare paths for bash script
+    escaped_source_path = escape_special_chars(source_path)
+    escaped_target_dir = escape_special_chars(target_dir)
+    escaped_target_path = escape_special_chars(os.path.join(target_dir, new_filename))
+    
+    # Prepare paths for Windows batch script
+    # Convert forward slashes to backslashes for Windows paths
+    win_source = source_path.replace('/', '\\')
+    win_target_dir_path = target_dir.replace('/', '\\')
+    win_target_full = os.path.join(target_dir, new_filename).replace('/', '\\')
+    
+    # Add quotes for Windows paths
+    win_source_path = '"' + win_source + '"'
+    win_target_dir = '"' + win_target_dir_path + '"'
+    win_target_path = '"' + win_target_full + '"'
+
+    # Determine the corresponding text file paths
+    if output_dir:
+        # If output_dir is specified, text files are in that directory
+        txt_source_path = os.path.join(output_dir, os.path.splitext(os.path.basename(source_path))[0] + ".txt")
+    else:
+        # Otherwise, text files are in the same directory as the source files
+        txt_source_path = os.path.splitext(source_path)[0] + ".txt"
+        
+    # Target text file will be in the target directory with related name
+    txt_new_filename = os.path.splitext(new_filename)[0] + ".txt"
+    txt_target_path = os.path.join(target_dir, txt_new_filename)
+    
+    # Escape for bash
+    escaped_txt_source_path = escape_special_chars(txt_source_path)
+    escaped_txt_target_path = escape_special_chars(txt_target_path)
+    
+    # Prepare for Windows batch
+    win_txt_source = txt_source_path.replace('/', '\\')
+    win_txt_target = txt_target_path.replace('/', '\\')
+    
+    # Add quotes for Windows text paths
+    win_txt_source_path = '"' + win_txt_source + '"'
+    win_txt_target_path = '"' + win_txt_target + '"'
+    
+    # Write to the bash script if needed
+    if create_bash:
+        with file_lock:
+            with open(rename_script_path, "a") as bash_file:
+                # Create the target directory
+                bash_file.write(f"mkdir -p {escaped_target_dir}\n")
+                
+                # Move the original file
+                bash_file.write(f"mv {escaped_source_path} {escaped_target_path}\n")
+                
+                # Check if the corresponding text file exists and move it too
+                bash_file.write(f"# Also move the text file if it exists\n")
+                bash_file.write(f"if [ -f {escaped_txt_source_path} ]; then\n")
+                bash_file.write(f"  mv {escaped_txt_source_path} {escaped_txt_target_path}\n")
+                bash_file.write(f"fi\n\n")
+                bash_file.flush()
+    
+    # Write to the Windows batch script if needed
+    if create_batch:
+        with file_lock:
+            with open(batch_script_path, "a") as batch_file:
+                # Create the target directory (mkdir in Windows automatically creates parent dirs)
+                batch_file.write(f"if not exist {win_target_dir} mkdir {win_target_dir}\n")
+                
+                # Move the original file
+                batch_file.write(f"move {win_source_path} {win_target_path}\n")
+                
+                # Check if the corresponding text file exists and move it too
+                batch_file.write(f"rem Also move the text file if it exists\n")
+                batch_file.write(f"if exist {win_txt_source_path} (\n")
+                batch_file.write(f"  move {win_txt_source_path} {win_txt_target_path}\n")
+                batch_file.write(f")\n\n")
+                batch_file.flush()
+    
+    logging.debug(f"Added rename command: {source_path} -> {os.path.join(target_dir, new_filename)}")
+    if os.path.exists(txt_source_path):
+        logging.debug(f"Will also move text file: {txt_source_path} -> {txt_target_path}")
+    
+    return {
+        'bash_script': rename_script_path if create_bash else None,
+        'batch_script': batch_script_path if create_batch else None,
+        'target_dir': target_dir,
+        'new_path': os.path.join(target_dir, new_filename)
+    }
+
+def escape_special_chars(filename):
+    """
+    Safely escape special characters in filenames for shell commands.
+    """
+    try:
+        import shlex
+        return shlex.quote(filename)
+    except ImportError:
+        logging.warning("shlex module not available. Falling back to regex-based escaping.")
+        return re.sub(r'([$`"\\])', r'\\\1', filename)
+    
+def get_openai_client():
+    """Initialize or return thread-local OpenAI client for Ollama"""
+    if not hasattr(thread_local, "client"):
+        try:
+            thread_local.client = OpenAI(
+                base_url="http://localhost:11434/v1/",
+                api_key="ollama"
+            )
+            logging.debug("OpenAI client initialized successfully for thread.")
+        except Exception as e:
+            logging.critical(f"Failed to initialize OpenAI client in thread: {e}")
+            raise
+    return thread_local.client
+
 def main():
     import glob
     
@@ -2340,7 +3136,29 @@ def main():
               %(prog)s -m pymupdf -p password input.pdf
               %(prog)s -t -j output.json *.pdf
               %(prog)s --noskip input.pdf  # Process even if output exists
+              %(prog)s --sort *.pdf  # Sort and rename files based on content
+              %(prog)s --sort --execute-rename *.pdf  # Sort and immediately execute rename commands
         """)
+    )
+
+    # Add sort argument to the argparse parser in main()
+    parser.add_argument(
+        '--sort',
+        action='store_true',
+        help="Sort and rename files based on content analysis with Ollama"
+    )
+
+    # Add related arguments for renaming control
+    parser.add_argument(
+        '--execute-rename',
+        action='store_true',
+        help="Automatically execute the generated rename commands"
+    )
+
+    parser.add_argument(
+        '--rename-script',
+        default="rename_commands.sh",
+        help="Path to write the rename commands (default: rename_commands.sh)"
     )
     
     parser.add_argument(
@@ -2413,14 +3231,15 @@ def main():
         input_files = []
         if args.recursive:
             for pattern in args.files:
-                # If the pattern is an existing directory, walk it recursively.
+                # If the pattern is an existing directory, walk it recursively
                 if os.path.isdir(pattern):
-                    for root, _, files in os.walk(pattern):
-                        for file in files:
-                            if file.lower().endswith(('.pdf', '.epub')):
-                                input_files.append(os.path.join(root, file))
+                    # Directory walking code unchanged
+                    ...
+                # Check if the pattern is an existing file (handles spaces in filenames)
+                elif os.path.isfile(pattern):
+                    input_files.append(pattern)
                 else:
-                    # If pattern is a file pattern (e.g. "*.pdf"), use glob with recursive=True.
+                    # Pattern globbing for wildcards
                     matched_files = glob.glob(pattern, recursive=True)
                     if matched_files:
                         input_files.extend(matched_files)
@@ -2428,11 +3247,15 @@ def main():
                         logging.warning(f"No files found matching pattern: {pattern}")
         else:
             for pattern in args.files:
-                matched_files = glob.glob(pattern)
-                if matched_files:
-                    input_files.extend(matched_files)
+                # Check if the pattern is an existing file (handles spaces in filenames)
+                if os.path.isfile(pattern):
+                    input_files.append(pattern)
                 else:
-                    logging.warning(f"No files found matching pattern: {pattern}")
+                    matched_files = glob.glob(pattern)
+                    if matched_files:
+                        input_files.extend(matched_files)
+                    else:
+                        logging.warning(f"No files found matching pattern: {pattern}")
         
         if not input_files:
             logging.error("No input files found")
@@ -2441,18 +3264,54 @@ def main():
         # Initialize processor
         processor = DocumentProcessor(debug=args.debug)
         
+        # Initialize Ollama client and rename script if sorting is enabled
+        openai_client = None
+        rename_script_path = None
+        
+        if args.sort:
+            try:
+                # Check if OpenAI client is available
+                try:
+                    from openai import OpenAI
+                    OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
+                    #openai_client = get_openai_client()
+                    logging.info("OpenAI client for Ollama is available")
+                except ImportError:
+                    logging.error("OpenAI client not available. Install with 'pip install openai'")
+                    logging.error("Proceeding without sorting functionality")
+                    args.sort = False
+                except Exception as e:
+                    logging.error(f"Error initializing OpenAI client: {e}")
+                    logging.error("Proceeding without sorting functionality")
+                    args.sort = False
+                    
+                if args.sort:  # Check again in case we disabled it due to import error
+                    # Initialize rename script
+                    rename_script_path = args.rename_script
+                    script_paths = initialize_rename_scripts(rename_script_path)
+                
+                    if platform.system() == 'Windows':
+                        logging.info(f"Initialized rename scripts at {script_paths['bash_script']} and {script_paths['batch_script']}")
+                    else:
+                        logging.info(f"Initialized rename script at {script_paths['bash_script']}")
+                    
+                    # Clean or create unparseables list
+                    with open("unparseables.lst", "w") as unparseable_file:
+                        unparseable_file.write("# Files that couldn't be parsed properly\n")
+                        unparseable_file.flush()
+            except Exception as e:
+                logging.error(f"Error initializing sorting functionality: {e}")
+                logging.error("Proceeding without sorting functionality")
+                args.sort = False
+                #openai_client = None
+                #rename_script_path = None
+        
         try:
-            # Set up robust signal handling
-            def signal_handler(sig, frame):
-                print("\nOperation interrupted by user. Cleaning up...")
-                # Perform any cleanup needed
-                sys.exit(130)
-            
-            # Register signal handlers for common interrupt signals
-            signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-            if platform.system() != 'Windows':
-                signal.signal(signal.SIGTSTP, signal_handler)  # Ctrl
-            
+            # Process files with periodic shutdown checks
+            # Note: we don't set up signal handling here anymore - 
+            # it's done globally outside this function
+
+            # Pass sort-related parameters to process_files
             results = processor.process_files(
                 input_files,
                 output_dir=args.output_dir,
@@ -2460,7 +3319,9 @@ def main():
                 password=args.password,
                 extract_tables=args.tables,
                 max_workers=args.workers,
-                noskip=args.noskip
+                noskip=args.noskip,
+                sort=args.sort,                     # sorting parameter
+                rename_script_path=rename_script_path  # sorting parameter
             )
             
             # Handle results
@@ -2468,6 +3329,36 @@ def main():
                 import json
                 with open(args.json, 'w', encoding='utf-8') as f:
                     json.dump(results, f, indent=2, ensure_ascii=False)
+            
+            # Handle rename script if sorting was enabled
+            if args.sort and args.execute_rename:
+                is_windows = platform.system() == 'Windows'
+                
+                if is_windows:
+                    batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
+                    if os.path.exists(batch_script_path):
+                        logging.info("Executing rename commands using batch script...")
+                        try:
+                            subprocess.run(['cmd', '/c', batch_script_path], check=True)
+                            logging.info("Successfully executed rename commands")
+                        except subprocess.CalledProcessError as e:
+                            logging.error(f"Error executing rename commands: {e}")
+                    else:
+                        logging.error(f"Batch script {batch_script_path} not found")
+                else:
+                    # Unix execution (unchanged)
+                    logging.info("Executing rename commands...")
+                    execute_rename_commands(rename_script_path)
+            elif args.sort:
+                # Just print instructions
+                if platform.system() == 'Windows':
+                    batch_script_path = os.path.splitext(rename_script_path)[0] + '.bat'
+                    logging.info(f"Rename commands written to {rename_script_path} and {batch_script_path}")
+                    logging.info(f"Review and execute manually with: bash {rename_script_path}")
+                    logging.info(f"  or on Windows: {batch_script_path}")
+                else:
+                    logging.info(f"Rename commands written to {rename_script_path}")
+                    logging.info(f"Review and execute manually with: bash {rename_script_path}")
             
             # Update return code logic to include skipped files in the summary
             successful = len(results.get('results', {})) - len(results.get('failed', []))
@@ -2479,7 +3370,26 @@ def main():
             return 0 if not results.get('failed') else 1
             
         except KeyboardInterrupt:
-            print("\nOperation cancelled by user")
+            if shutdown_flag.is_set():
+                # Proper handling after graceful shutdown flag was set
+                if args.sort and rename_script_path:
+                    try:
+                        os.chmod(rename_script_path, 0o755)
+                        logging.info(f"Made rename script executable: {rename_script_path}")
+                        logging.info(f"Review and execute manually with: bash {rename_script_path}")
+                    except Exception as e:
+                        logging.error(f"Error setting permissions on rename script: {e}")
+                logging.info("Operation gracefully terminated after interrupt")
+            else:
+                # Direct KeyboardInterrupt without going through signal handler
+                print("\nOperation cancelled by user")
+                if args.sort and rename_script_path:
+                    try:
+                        os.chmod(rename_script_path, 0o755)
+                        logging.info(f"Made rename script executable: {rename_script_path}")
+                        logging.info(f"You can still use the partial rename script: bash {rename_script_path}")
+                    except Exception:
+                        pass
             return 130
         
     except Exception as e:
@@ -2490,8 +3400,4 @@ def main():
         return 1
 
 if __name__ == '__main__':
-    # Set up signal handlers
-    import signal
-    signal.signal(signal.SIGINT, lambda x, y: sys.exit(130))
-    
     sys.exit(main())

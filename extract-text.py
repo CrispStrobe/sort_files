@@ -624,6 +624,10 @@ def send_to_llm(text: str, filename: str, provider: Union[str, LLMProvider],
     Returns:
         str: The formatted metadata response
     """
+    if isinstance(provider, (int, float)):
+        logging.error(f"Invalid provider parameter: {provider} (type: {type(provider)}). Expected provider string or LLMProvider instance.")
+        return ""
+        
     # Get or validate provider
     if isinstance(provider, str):
         try:
@@ -675,8 +679,9 @@ def send_to_llm(text: str, filename: str, provider: Union[str, LLMProvider],
         template_index = min(attempt - 1, len(prompt_templates) - 1)
         prompt_template = prompt_templates[template_index]
         
-        logging.debug(f"Consulting LLM on file: {filename} (Attempt: {attempt}, Template: {template_index + 1})")
-        
+        logging.debug(f"Consulting LLM {provider} on file: {filename} (Attempt: {attempt}, Template: {template_index + 1})")
+
+
         # Build the final prompt with text sample
         prompt = prompt_template + f"Here is the document text:\n{text[:3000]}"  # Limit text to avoid token limits
         messages = [{"role": "user", "content": prompt}]
@@ -949,7 +954,12 @@ class ExtractionManager:
                             # Process author names
                             author = metadata['author']
                             logging.debug(f"extracted author: {author}")
-                            corrected_author = sort_author_names(author, llm_provider)
+                            corrected_author = sort_author_names(
+                                author_names=author,
+                                provider=llm_provider,
+                                #temperature=temperature,
+                                #max_tokens=max_tokens
+                            )
                             logging.debug(f"corrected author: {corrected_author}")
                             metadata['author'] = corrected_author
                             
@@ -2895,7 +2905,8 @@ class DocumentProcessor:
                         input_file,
                         output_dir,
                         method,
-                        password,
+                        ocr_method,  # Add this parameter in the correct position
+                        password,    # Move password to the correct position
                         extract_tables,
                         noskip,
                         sort,                     
@@ -3050,6 +3061,8 @@ class DocumentProcessor:
         }
         
         try:
+            logging.debug(f"Processing metadata for llm {llm_provider}.")
+
             # Get metadata using the appropriate provider
             is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
             
@@ -3058,7 +3071,11 @@ class DocumentProcessor:
                 metadata_content = send_to_ollama_server(text, input_file, llm_provider)
             else:
                 # Using an LLM provider instance
-                metadata_content = send_to_llm(text, input_file, llm_provider)
+                metadata_content = send_to_llm(
+                    text=text, 
+                    filename=input_file, 
+                    provider=llm_provider
+                )
                 
             if not metadata_content:
                 result['error'] = "Failed to get metadata from LLM provider"
@@ -3086,9 +3103,19 @@ class DocumentProcessor:
                 
             # Process author with appropriate provider
             if is_openai_client:
-                corrected_author = sort_author_names(author, llm_provider)
+                corrected_author = corrected_author = sort_author_names(
+                    author_names=author,
+                    provider=llm_provider,
+                    #temperature=temperature,
+                    #max_tokens=max_tokens
+                )
             else:
-                corrected_author = sort_author_names(author, llm_provider)
+                corrected_author = corrected_author = sort_author_names(
+                    author_names=author,
+                    provider=llm_provider,
+                    #temperature=temperature,
+                    #max_tokens=max_tokens
+                )
                 
             if not corrected_author or corrected_author == "UnknownAuthor":
                 result['error'] = "Failed to format author name correctly"
@@ -3269,6 +3296,7 @@ class DocumentProcessor:
         
         try:
             # Generate basic output path (no uniqueness yet)
+            logging.debug(f"Processing for {llm_provider}.")
             basic_output_path = self._get_unique_output_path(input_file, output_dir, noskip=False)
             
             # Check if we should skip this file
@@ -3372,9 +3400,12 @@ class DocumentProcessor:
                         metadata_content = send_to_ollama_server(text, input_file, openai_client)
                     else:
                         # Use the provided LLM provider
-                        metadata_content = send_to_llm(text, input_file, llm_provider, 
-                                                    temperature=temperature,
-                                                    max_tokens=max_tokens)
+                        logging.debug(f"Sending to llm {llm_provider}.")
+                        metadata_content = send_to_llm(
+                            text=text, 
+                            filename=input_file, 
+                            provider=llm_provider
+                        )
                     
                     if metadata_content:
                         # Parse metadata with improved parser
@@ -3388,9 +3419,12 @@ class DocumentProcessor:
                             if is_openai_client:
                                 corrected_author = sort_author_names(author, openai_client)
                             else:
-                                corrected_author = sort_author_names(author, llm_provider, 
-                                                                temperature=temperature,
-                                                                max_tokens=max_tokens)
+                                corrected_author = corrected_author = sort_author_names(
+                                    author_names=author,
+                                    provider=llm_provider,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens
+                                )
                             
                             logging.debug(f"corrected author: {corrected_author}")
                             metadata['author'] = corrected_author
@@ -4012,6 +4046,10 @@ def sort_author_names(author_names, provider, temperature: float = 0.3,
         max_attempts: Maximum retry attempts
         verbose: Whether to print debug info
     """
+    if provider is None or isinstance(provider, (int, float)):
+        logging.warning(f"Invalid provider passed to sort_author_names: {provider}")
+        return author_names
+    
     if not author_names or author_names.strip() in ["Unknown", "UnknownAuthor", "n a", ""]:
         return "UnknownAuthor"
     
@@ -4090,6 +4128,10 @@ def sort_author_names(author_names, provider, temperature: float = 0.3,
         # Use the semaphore to limit concurrent requests
         with llm_semaphore:
             try:
+                if not hasattr(provider, 'chat_completion'):
+                    logging.warning(f"Provider {provider} missing chat_completion method")
+                    return author_names
+                
                 if is_openai_client:
                     # Using OpenAI client for Ollama
                     response = provider.chat.completions.create(
@@ -4172,6 +4214,10 @@ def extract_metadata(text, filename, llm_provider):
     Returns:
         str: The metadata response
     """
+    if isinstance(llm_provider, (int, float)):
+        logging.error(f"Invalid llm_provider parameter: {llm_provider} (type: {type(llm_provider)})")
+        return ""
+    
     # Check if we're using OpenAI client for Ollama or an LLM provider
     is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
     

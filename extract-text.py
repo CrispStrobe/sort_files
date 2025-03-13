@@ -1410,9 +1410,12 @@ class PDFExtractor:
         'pypdf',        # Simple but reliable
         'pdfminer',     # Good layout preservation
         'tesseract',    # OCR support
-        'doctr',        # Deep learning OCR
         'easyocr',      # Alternative OCR
-        'kraken'        # Advanced OCR
+        'paddleocr',    # multilingual: https://paddlepaddle.github.io/PaddleOCR/main/en/ppocr/blog/multi_languages.html
+        'doctr',        # Deep learning OCR 
+        'kraken_cli',   # Kraken CLI method (seems we still need e.g. numpy==1.26.4 & tensorflow-macos-2.15.0)
+        'kraken'        # Kraken API method (lower priority)
+        
     ]
     TABLE_METHODS = ['camelot']
     
@@ -1622,6 +1625,16 @@ class PDFExtractor:
             if self._debug:
                 logging.debug("pytesseract or pdf2image not available")
 
+        # PaddleOCR check
+        try:
+            from paddleocr import PaddleOCR
+            self._initialized_methods.add('paddleocr')
+            if self._debug:
+                logging.debug("PaddleOCR available")
+        except ImportError:
+            if self._debug:
+                logging.debug("PaddleOCR not available")
+
         # Skip problematic OCR dependencies in normal operation
         # They'll be checked when actually needed
         if self._debug:
@@ -1653,7 +1666,7 @@ class PDFExtractor:
             return True
             
         # For OCR methods, check on demand if not already checked
-        if method in ['tesseract', 'doctr', 'easyocr', 'kraken'] and method not in self._initialized_methods:
+        if method in ['tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli'] and method not in self._initialized_methods:
             try:
                 if method == 'tesseract':
                     # Only check if tesseract binary exists
@@ -1677,13 +1690,23 @@ class PDFExtractor:
                     # Skip doctr - it's causing numpy compatibility issues
                     return False
                     
+                elif method == 'paddleocr':
+                    return False
+                
                 elif method == 'easyocr':
                     # Skip easyocr - it's causing numpy compatibility issues
                     return False
                     
                 elif method == 'kraken':
-                    # Skip kraken - it's causing compatibility issues
-                    return False
+                    # Skip original kraken method if it's in the failed methods list
+                    if method in self._ocr_failed_methods:
+                        return False
+                    # Otherwise try to import it - note this might still fail at runtime
+                    return self._import_cache.is_available('kraken')
+                    
+                elif method == 'kraken_cli':
+                    # Check if kraken CLI is available
+                    return shutil.which('kraken') is not None
                     
             except Exception as e:
                 if self._debug:
@@ -1706,42 +1729,8 @@ class PDFExtractor:
             }
         return self._available_methods
 
-    def _is_method_available_old(self, method: str) -> bool:
-        """Check method availability with dependencies"""
-        if method not in self._checked_methods:
-            try:
-                if method == 'pymupdf':
-                    self._checked_methods[method] = self._import_cache.is_available('fitz')
-                elif method == 'pdfplumber':
-                    self._checked_methods[method] = self._import_cache.is_available('pdfplumber')
-                elif method == 'pypdf':
-                    self._checked_methods[method] = self._import_cache.is_available('pypdf')
-                elif method == 'pdfminer':
-                    self._checked_methods[method] = self._import_cache.is_available('pdfminer.high_level')
-                elif method == 'tesseract':
-                    self._checked_methods[method] = (
-                        self._import_cache.is_available('pytesseract') and
-                        self._import_cache.is_available('pdf2image') and
-                        self._binaries.get('tesseract', False)
-                    )
-                elif method == 'kraken':
-                    self._checked_methods[method] = self._import_cache.is_available('kraken')
-                elif method == 'easyocr':
-                    self._checked_methods[method] = self._import_cache.is_available('easyocr')
-                elif method == 'doctr':
-                    self._checked_methods[method] = self._import_cache.is_available('doctr')
-                elif method == 'camelot':
-                    self._checked_methods[method] = (
-                        self._import_cache.is_available('camelot') and
-                        self._binaries.get('gs', False)
-                    )
-            except Exception as e:
-                logging.debug(f"Error checking {method}: {e}")
-                self._checked_methods[method] = False
-                
-        return self._checked_methods[method]
-
     def extract_text(self, pdf_path: str, preferred_method: Optional[str] = None,
+                ocr_method: Optional[str] = None,
                 progress_callback: Optional[Callable] = None, **kwargs) -> str:
         """Extract text with optimized fallback methods"""
         if not os.path.exists(pdf_path):
@@ -1751,18 +1740,28 @@ class PDFExtractor:
         methods = ['pymupdf', 'pdfplumber', 'pypdf', 'pdfminer']  # Fast and reliable methods
         
         # Define OCR methods
-        ocr_methods = ['tesseract', 'doctr', 'easyocr', 'kraken']
-        
+        ocr_methods = ['tesseract', 'easyocr', 'paddleocr', 'doctr', 'kraken', 'kraken_cli']
+
+        # If a specific OCR method is provided, prioritize it
+        if ocr_method and ocr_method != 'auto':
+            # Remove it from its current position if present
+            if ocr_method in ocr_methods:
+                ocr_methods.remove(ocr_method)
+            # Add it to the front of OCR methods
+            ocr_methods.insert(0, ocr_method)
+            if self._debug:
+                logging.info(f"Prioritizing OCR method: {ocr_method}")
         # If a specific preferred method is provided and it's an OCR method,
-        # move it to the front of the OCR methods list
-        if preferred_method and preferred_method in ocr_methods:
+        # also prioritize it (for backward compatibility)
+        elif preferred_method and preferred_method in ocr_methods:
             # Remove it from its current position if present
             if preferred_method in ocr_methods:
                 ocr_methods.remove(preferred_method)
             # Add it to the front of OCR methods
             ocr_methods.insert(0, preferred_method)
             if self._debug:
-                logging.info(f"Prioritizing OCR method: {preferred_method}")
+                logging.info(f"Prioritizing OCR method via preferred_method: {preferred_method}")
+        
         
         text_parts = []
         current_method = None
@@ -1775,8 +1774,7 @@ class PDFExtractor:
                     
                 try:
                     current_method = method
-                    if self._debug:
-                        logging.info(f"Trying extraction with {method}...")
+                    logging.debug(f"Trying extraction with {method}...")
                     
                     if progress_callback:
                         progress_callback(0, method)
@@ -2232,82 +2230,1150 @@ class PDFExtractor:
                 output.close()
     
     def extract_with_doctr(self, pdf_path: str, progress_callback=None) -> str:
-        """Extract text using docTR with proper API handling."""
+        """
+        Extract text using DocTR with enhanced model configuration and text block handling.
+        Optimized for speed - stops after first successful extraction.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
         if not self._init_ocr('doctr'):
+            logging.error("DocTR initialization failed")
             return ""
             
         try:
-            # Use proper docTR imports and API
+            # Import required packages with better error handling
+            try:
+                pdf2image = self._import_cache.import_module('pdf2image')
+                import numpy as np
+                import io
+                from PIL import Image
+                import traceback
+            except ImportError as e:
+                logging.error(f"Failed to import required packages for DocTR: {e}")
+                return ""
+            
+            # Get DocTR
             doctr = self._doctr
             
-            # Load document
-            with tqdm(desc="Loading document", unit="file") as pbar:
-                try:
-                    # Load PDF document
-                    doc = doctr.io.DocumentFile.from_pdf(pdf_path)
-                    pbar.update(1)
-                except Exception as e:
-                    logging.error(f"DocTR document loading failed: {e}")
-                    return ""
+            text_parts = []
             
-            # Initialize predictor if needed
-            if not hasattr(self, '_doctr_predictor') or self._doctr_predictor is None:
-                try:
-                    # Initialize OCR predictor with default pretrained model
-                    self._doctr_predictor = doctr.models.ocr_predictor(pretrained=True)
-                    logging.info("DocTR OCR predictor initialized")
-                except Exception as e:
-                    logging.error(f"Failed to initialize DocTR predictor: {e}")
-                    return ""
+            # Configure PDF conversion settings for better OCR results
+            conversion_settings = {
+                'dpi': 300,              # Default DPI
+                'thread_count': 1,       # Single thread for stability
+                'grayscale': False,      # DocTR works better with color images
+                'size': (None, None),    # Default to original size
+                'use_cropbox': True,     # Use cropbox for better results
+                'strict': False          # Continue even with errors
+            }
             
-            # Process document with predictor
+            logging.info(f"Starting DocTR extraction for {pdf_path}")
+            
+            # Try multiple DPI settings if first attempt fails
+            dpi_options = [300, 600]  # Reduced to just two options for speed
+            
+            for dpi_attempt, dpi in enumerate(dpi_options):
+                if dpi_attempt > 0:
+                    logging.info(f"Trying PDF conversion with increased DPI: {dpi}")
+                    
+                # Update DPI for this attempt
+                conversion_settings['dpi'] = dpi
+                
+                # Convert PDF to images first
+                with tqdm(desc=f"Converting PDF to images for DocTR (DPI: {dpi})", unit="page") as pbar:
+                    try:
+                        # Convert PDF pages to PIL images
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            **conversion_settings
+                        )
+                        pbar.update(len(images))
+                        logging.info(f"Successfully converted {len(images)} pages from PDF (DPI: {dpi})")
+                    except Exception as e:
+                        logging.error(f"PDF to image conversion failed at DPI {dpi}: {e}")
+                        if dpi_attempt < len(dpi_options) - 1:
+                            continue  # Try next DPI
+                        else:
+                            return ""  # All DPI options failed
+                
+                # Optimize model configurations - fastest first
+                model_configs = [
+                    # Default model - usually fastest and effective enough
+                    {
+                        "name": "Default model",
+                        "det_arch": "db_resnet50",
+                        "reco_arch": "crnn_vgg16_bn",
+                        "assume_straight_pages": True,
+                        "straighten_pages": False
+                    },
+                    # Only use if first model doesn't work
+                    {
+                        "name": "Simple model",
+                        "det_arch": "db_resnet34",
+                        "reco_arch": "crnn_mobilenet_v3_small",
+                        "assume_straight_pages": True,
+                        "straighten_pages": False
+                    },
+                    # Last resort - slowest but most accurate
+                    {
+                        "name": "Alternative detection model",
+                        "det_arch": "linknet_resnet18",
+                        "reco_arch": "crnn_vgg16_bn",
+                        "assume_straight_pages": False,
+                        "straighten_pages": True
+                    }
+                ]
+                
+                # Track if we've succeeded with any model
+                extraction_success = False
+                
+                # Try each model configuration until we find one that works
+                for model_idx, model_config in enumerate(model_configs):
+                    # Skip slower models if we already have text
+                    if extraction_success:
+                        logging.info(f"Skipping {model_config['name']} since text was already extracted successfully")
+                        continue
+                    
+                    model_text_parts = []  # Store text from this model configuration
+                    
+                    logging.info(f"Trying DocTR with {model_config['name']} configuration")
+                    
+                    # Initialize DocTR predictor with this configuration
+                    try:
+                        logging.info(f"Initializing DocTR predictor with {model_config['det_arch']} detection model")
+                        self._doctr_predictor = doctr.models.ocr_predictor(
+                            det_arch=model_config['det_arch'],
+                            reco_arch=model_config['reco_arch'],
+                            pretrained=True,
+                            assume_straight_pages=model_config['assume_straight_pages'],
+                            straighten_pages=model_config['straighten_pages']
+                        )
+                        logging.info("DocTR OCR predictor initialized with custom configuration")
+                    except Exception as e:
+                        logging.error(f"Failed to initialize DocTR predictor with custom config: {e}")
+                        continue  # Try next configuration
+                    
+                    # Make fresh copy of images for this model
+                    model_images = []
+                    for img in images:
+                        img_copy = img.copy()
+                        model_images.append(img_copy)
+                    
+                    # Process each image with extensive error handling
+                    with tqdm(total=len(model_images), desc="DocTR processing", unit="page") as pbar:
+                        page_success_count = 0
+                        
+                        for i, image in enumerate(model_images):
+                            try:
+                                # Convert PIL image to numpy array
+                                img_np = np.array(image)
+                                
+                                # Try different preprocessing techniques
+                                processed_images = [
+                                    img_np,  # Original image
+                                    self._apply_contrast_enhancement(img_np),  # Enhanced contrast
+                                    self._apply_binarization(img_np)  # Binary image
+                                ]
+                                
+                                # Flag to track if we extracted text from this page
+                                page_success = False
+                                page_text = ""
+                                
+                                # Try each preprocessing technique
+                                for img_variant_idx, img_variant in enumerate(processed_images):
+                                    # Stop if we already got text from this page
+                                    if page_success:
+                                        break
+                                        
+                                    variant_name = ["Original", "Enhanced", "Binary"][img_variant_idx]
+                                    logging.debug(f"Trying {variant_name} image for page {i}")
+                                    
+                                    try:
+                                        # Process with DocTR
+                                        result = self._doctr_predictor([img_variant])
+                                        
+                                        # Check if we got any results
+                                        if result and hasattr(result, 'pages') and result.pages:
+                                            page = result.pages[0]
+                                            
+                                            # Force block creation for difficult documents
+                                            if not hasattr(page, 'blocks') or len(page.blocks) == 0:
+                                                logging.debug(f"No blocks detected, applying forced block detection")
+                                                
+                                                # Attempt to extract text directly from the image using forced detection
+                                                current_page_text = self._extract_text_with_forced_detection(img_variant, i)
+                                                
+                                                if current_page_text and current_page_text.strip():
+                                                    page_text = current_page_text
+                                                    page_success = True
+                                                    break  # Success with this preprocessing technique
+                                            else:
+                                                # Normal extraction if blocks are detected
+                                                current_page_text = self._extract_doctr_text_from_image(img_variant, i)
+                                                
+                                                if current_page_text and current_page_text.strip():
+                                                    page_text = current_page_text
+                                                    page_success = True
+                                                    break  # Success with this preprocessing technique
+                                    except Exception as variant_e:
+                                        logging.debug(f"Error processing {variant_name} variant: {variant_e}")
+                                
+                                # Add page text if successful
+                                if page_success and page_text:
+                                    model_text_parts.append(page_text)
+                                    page_success_count += 1
+                                    logging.debug(f"Successfully extracted text from page {i}")
+                                
+                                # Update progress
+                                pbar.update(1)
+                                if progress_callback:
+                                    progress_callback(1)
+                            except Exception as e:
+                                logging.error(f"DocTR failed on page {i}: {e}")
+                                logging.debug(f"Traceback: {traceback.format_exc()}")
+                            finally:
+                                try:
+                                    image.close()
+                                except:
+                                    pass
+                    
+                    logging.info(f"DocTR successful pages with {model_config['name']}: {page_success_count}/{len(model_images)}")
+                    
+                    # Check if this model configuration worked well enough
+                    if page_success_count > 0:
+                        extraction_success = True
+                        text_parts = model_text_parts
+                        logging.info(f"Successfully extracted text with {model_config['name']}. Skipping remaining models.")
+                        break  # Exit model loop - we found a working model
+                
+                # If we got text with this DPI, stop trying more DPIs
+                if extraction_success:
+                    break
+                    
+            if text_parts:
+                final_text = "\n\n".join(text_parts)
+                logging.info(f"DocTR extraction completed with {len(final_text)} characters")
+                return final_text
+            else:
+                logging.warning("DocTR: No text extracted from any page with any configuration")
+                return ""
+        
+        except Exception as e:
+            logging.error(f"DocTR extraction failed: {e}")
+            logging.debug(f"Traceback: {traceback.format_exc()}")
+            return ""
+        finally:
+            # Clean up resources
+            if 'images' in locals() and images:
+                for img in images:
+                    try:
+                        img.close()
+                    except:
+                        pass
+            
+            # Clear GPU memory
+            self._clear_gpu_memory()
+    
+    def extract_with_doctr_tryall(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using DocTR with enhanced model configuration and text block handling.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
+        if not self._init_ocr('doctr'):
+            logging.error("DocTR initialization failed")
+            return ""
+            
+        try:
+            # Import required packages with better error handling
             try:
-                # Use the predictor on the whole document at once
-                result = self._doctr_predictor(doc)
+                pdf2image = self._import_cache.import_module('pdf2image')
+                import numpy as np
+                import io
+                from PIL import Image
+                import traceback
+            except ImportError as e:
+                logging.error(f"Failed to import required packages for DocTR: {e}")
+                return ""
+            
+            # Get DocTR
+            doctr = self._doctr
+            
+            text_parts = []
+            all_extracted_text = []  # Store text from all model configurations
+            
+            # Configure PDF conversion settings for better OCR results
+            conversion_settings = {
+                'dpi': 300,              # Default DPI
+                'thread_count': 1,       # Single thread for stability
+                'grayscale': False,      # DocTR works better with color images
+                'size': (None, None),    # Default to original size
+                'use_cropbox': True,     # Use cropbox for better results
+                'strict': False          # Continue even with errors
+            }
+            
+            logging.info(f"Starting DocTR extraction for {pdf_path}")
+            
+            # Try multiple DPI settings if first attempt fails
+            dpi_options = [300, 400, 600]
+            
+            for dpi_attempt, dpi in enumerate(dpi_options):
+                if dpi_attempt > 0:
+                    logging.info(f"Trying PDF conversion with increased DPI: {dpi}")
+                    
+                # Update DPI for this attempt
+                conversion_settings['dpi'] = dpi
                 
-                # Extract text from result with proper error handling
-                text_parts = []
+                # Convert PDF to images first
+                with tqdm(desc=f"Converting PDF to images for DocTR (DPI: {dpi})", unit="page") as pbar:
+                    try:
+                        # Convert PDF pages to PIL images
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            **conversion_settings
+                        )
+                        pbar.update(len(images))
+                        logging.info(f"Successfully converted {len(images)} pages from PDF (DPI: {dpi})")
+                    except Exception as e:
+                        logging.error(f"PDF to image conversion failed at DPI {dpi}: {e}")
+                        if dpi_attempt < len(dpi_options) - 1:
+                            continue  # Try next DPI
+                        else:
+                            return ""  # All DPI options failed
                 
-                # Fix: Safely access text content
+                # Make copies of all images for each model configuration
+                # This prevents the "closed image" error when switching between models
+                image_copies = []
+                for img in images:
+                    img_copy = img.copy()
+                    image_copies.append(img_copy)
+                
+                # Try multiple model configurations for detection
+                model_configs = [
+                    # Default model
+                    {
+                        "name": "Default model",
+                        "det_arch": "db_resnet50",
+                        "reco_arch": "crnn_vgg16_bn",
+                        "assume_straight_pages": True,
+                        "straighten_pages": False
+                    },
+                    # Alternative model for harder documents
+                    {
+                        "name": "Alternative detection model",
+                        "det_arch": "linknet_resnet18",
+                        "reco_arch": "crnn_vgg16_bn",
+                        "assume_straight_pages": False,
+                        "straighten_pages": True
+                    },
+                    # Third model focused on handling unusual documents
+                    {
+                        "name": "Simple model",
+                        "det_arch": "db_resnet34",
+                        "reco_arch": "crnn_mobilenet_v3_small",
+                        "assume_straight_pages": True,
+                        "straighten_pages": False
+                    }
+                ]
+                
+                # Try each model configuration until we find one that works
+                for model_idx, model_config in enumerate(model_configs):
+                    model_text_parts = []  # Store text from this model configuration
+                    
+                    logging.info(f"Trying DocTR with {model_config['name']} configuration")
+                    
+                    # Initialize DocTR predictor with this configuration
+                    try:
+                        logging.info(f"Initializing DocTR predictor with {model_config['det_arch']} detection model")
+                        self._doctr_predictor = doctr.models.ocr_predictor(
+                            det_arch=model_config['det_arch'],
+                            reco_arch=model_config['reco_arch'],
+                            pretrained=True,
+                            assume_straight_pages=model_config['assume_straight_pages'],
+                            straighten_pages=model_config['straighten_pages']
+                        )
+                        logging.info("DocTR OCR predictor initialized with custom configuration")
+                    except Exception as e:
+                        logging.error(f"Failed to initialize DocTR predictor with custom config: {e}")
+                        continue  # Try next configuration
+                    
+                    # Make fresh copy of images for this model
+                    model_images = []
+                    if model_idx == 0:
+                        # For first model, use original copies
+                        model_images = image_copies
+                    else:
+                        # For subsequent models, make new copies to avoid closed image errors
+                        model_images = []
+                        for img in images:
+                            model_images.append(img.copy())
+                    
+                    # Process each image with extensive error handling
+                    with tqdm(total=len(model_images), desc="DocTR processing", unit="page") as pbar:
+                        page_success_count = 0
+                        
+                        for i, image in enumerate(model_images):
+                            try:
+                                # Convert PIL image to numpy array
+                                img_np = np.array(image)
+                                
+                                # Try different preprocessing techniques
+                                processed_images = [
+                                    img_np,  # Original image
+                                    self._apply_contrast_enhancement(img_np),  # Enhanced contrast
+                                    self._apply_binarization(img_np)  # Binary image
+                                ]
+                                
+                                # Flag to track if we extracted text from this page
+                                page_success = False
+                                page_text = ""
+                                
+                                # Try each preprocessing technique
+                                for img_variant_idx, img_variant in enumerate(processed_images):
+                                    variant_name = ["Original", "Enhanced", "Binary"][img_variant_idx]
+                                    logging.debug(f"Trying {variant_name} image for page {i}")
+                                    
+                                    try:
+                                        # Process with DocTR
+                                        result = self._doctr_predictor([img_variant])
+                                        
+                                        # Check if we got any results
+                                        if result and hasattr(result, 'pages') and result.pages:
+                                            page = result.pages[0]
+                                            
+                                            # Force block creation for difficult documents
+                                            if not hasattr(page, 'blocks') or len(page.blocks) == 0:
+                                                logging.debug(f"No blocks detected, applying forced block detection")
+                                                
+                                                # Attempt to extract text directly from the image using forced detection
+                                                current_page_text = self._extract_text_with_forced_detection(img_variant, i)
+                                                
+                                                if current_page_text and current_page_text.strip():
+                                                    page_text = current_page_text
+                                                    page_success = True
+                                                    break  # Success with this preprocessing technique
+                                            else:
+                                                # Normal extraction if blocks are detected
+                                                current_page_text = self._extract_doctr_text_from_image(img_variant, i)
+                                                
+                                                if current_page_text and current_page_text.strip():
+                                                    page_text = current_page_text
+                                                    page_success = True
+                                                    break  # Success with this preprocessing technique
+                                    except Exception as variant_e:
+                                        logging.debug(f"Error processing {variant_name} variant: {variant_e}")
+                                
+                                # Add page text if successful
+                                if page_success and page_text:
+                                    model_text_parts.append(page_text)
+                                    page_success_count += 1
+                                    logging.debug(f"Successfully extracted text from page {i}")
+                                
+                                # Update progress
+                                pbar.update(1)
+                                if progress_callback:
+                                    progress_callback(1)
+                            except Exception as e:
+                                logging.error(f"DocTR failed on page {i}: {e}")
+                                logging.debug(f"Traceback: {traceback.format_exc()}")
+                            finally:
+                                pass  # Don't close images here - we'll clean them up later
+                    
+                    logging.info(f"DocTR successful pages with {model_config['name']}: {page_success_count}/{len(model_images)}")
+                    
+                    # Save text from this model configuration
+                    if model_text_parts:
+                        all_extracted_text.append({
+                            'model': model_config['name'],
+                            'text': "\n\n".join(model_text_parts),
+                            'success_count': page_success_count,
+                            'total_pages': len(model_images)
+                        })
+                
+                # Clean up all image copies
+                for img in image_copies:
+                    try:
+                        img.close()
+                    except:
+                        pass
+                for img in model_images:
+                    try:
+                        img.close()
+                    except:
+                        pass
+                
+                # If we got text from any model with this DPI, stop trying more DPIs
+                if all_extracted_text:
+                    break
+                    
+            # Choose the best result from all model configurations
+            if all_extracted_text:
+                # Sort by success count (most successful pages first)
+                all_extracted_text.sort(key=lambda x: x['success_count'], reverse=True)
+                best_result = all_extracted_text[0]
+                
+                logging.info(f"Best DocTR result: {best_result['model']} with {best_result['success_count']}/{best_result['total_pages']} successful pages")
+                return best_result['text']
+            else:
+                logging.warning("DocTR: No text extracted from any page with any configuration")
+                return ""
+        
+        except Exception as e:
+            logging.error(f"DocTR extraction failed: {e}")
+            logging.debug(f"Traceback: {traceback.format_exc()}")
+            return ""
+        finally:
+            # Clean up resources
+            if 'images' in locals() and images:
+                for img in images:
+                    try:
+                        img.close()
+                    except:
+                        pass
+            
+            # Clear GPU memory
+            self._clear_gpu_memory()
+
+    def _apply_contrast_enhancement(self, image_np):
+        """Apply CLAHE contrast enhancement"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Convert to LAB color space
+            lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)
+            l_channel, a, b = cv2.split(lab)
+            
+            # Apply CLAHE to L-channel
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced_l = clahe.apply(l_channel)
+            
+            # Merge enhanced L-channel with original A and B channels
+            enhanced_lab = cv2.merge((enhanced_l, a, b))
+            
+            # Convert back to RGB
+            enhanced_rgb = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+            
+            return enhanced_rgb
+        except Exception as e:
+            logging.debug(f"Contrast enhancement failed: {e}")
+            return image_np
+
+    def _apply_binarization(self, image_np):
+        """Apply adaptive thresholding for binarization"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Convert to grayscale
+            if len(image_np.shape) == 3:
+                gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image_np
+                
+            # Apply adaptive thresholding
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # Convert back to RGB for DocTR
+            rgb = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+            
+            return rgb
+        except Exception as e:
+            logging.debug(f"Binarization failed: {e}")
+            return image_np
+
+    def _extract_text_with_forced_detection(self, image_np, page_idx):
+        """
+        Extract text by forcing block detection when DocTR fails to detect blocks.
+        This is a fallback method for difficult documents.
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # 1. Prepare the image
+            if len(image_np.shape) == 3:
+                gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image_np
+                
+            # 2. Apply adaptive thresholding
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY_INV, 11, 2
+            )
+            
+            # 3. Find contours - these will be potential text blocks
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # 4. Filter contours by size
+            height, width = gray.shape
+            min_area = height * width * 0.0001  # Minimum area threshold
+            max_area = height * width * 0.5     # Maximum area threshold
+            
+            valid_contours = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if min_area < area < max_area:
+                    valid_contours.append(contour)
+            
+            logging.debug(f"Found {len(valid_contours)} potential text blocks after filtering")
+            
+            if not valid_contours:
+                logging.debug("No valid contours found for forced detection")
+                return ""
+                
+            # 5. Extract and process each potential text block
+            text_parts = []
+            
+            for i, contour in enumerate(valid_contours):
                 try:
-                    for page_idx, page in enumerate(result.pages):
-                        # Safe access to text property
-                        try:
-                            page_export = page.export()
-                            if isinstance(page_export, dict) and "text" in page_export:
-                                page_text = page_export["text"]
-                                if page_text:
-                                    text_parts.append(page_text)
-                            else:
-                                logging.warning(f"DocTR: Missing text in page {page_idx} export")
-                        except Exception as page_e:
-                            logging.warning(f"DocTR: Error exporting page {page_idx}: {page_e}")
-                            continue
+                    # Get bounding box
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Extract region
+                    region = image_np[y:y+h, x:x+w]
+                    
+                    # Skip regions that are too small
+                    if region.shape[0] < 10 or region.shape[1] < 10:
+                        continue
+                    
+                    # Process the region with DocTR
+                    result = self._doctr_predictor([region])
+                    
+                    if result and hasattr(result, 'pages') and result.pages:
+                        page = result.pages[0]
+                        
+                        # Extract text from page
+                        if hasattr(page, 'export') and callable(page.export):
+                            export_data = page.export()
+                            if isinstance(export_data, dict) and "text" in export_data:
+                                block_text = export_data["text"].strip()
+                                if block_text:
+                                    text_parts.append(block_text)
+                                    logging.debug(f"Extracted text from forced block {i}: {block_text[:30]}...")
                 except Exception as e:
-                    logging.error(f"DocTR: Error processing result pages: {e}")
+                    logging.debug(f"Error processing forced block {i}: {e}")
+                    continue
+            
+            # 6. Combine all text
+            if text_parts:
+                return "\n".join(text_parts)
+            
+            return ""
+            
+        except Exception as e:
+            logging.error(f"Forced text detection failed: {e}")
+            return ""
+        
+    def extract_with_paddleocr(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using PaddleOCR with enhanced error handling for printed text.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
+        if not self._init_ocr('paddleocr'):
+            logging.error("PaddleOCR initialization failed")
+            return ""
+            
+        try:
+            # Import required packages
+            pdf2image = self._import_cache.import_module('pdf2image')
+            from PIL import Image
+            import numpy as np
+            import io
+            
+            # Reference to PaddleOCR instance
+            paddle_ocr = self._paddleocr
+            text_parts = []
+            images = None
+            
+            try:
+                # Convert PDF to images with lower DPI for better compatibility
+                with tqdm(desc="Converting PDF to images for PaddleOCR", unit="page") as pbar:
+                    try:
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            dpi=200,  # Lower DPI for better compatibility
+                            thread_count=1,
+                            grayscale=False,
+                            fmt="jpeg"  # Use JPEG for better compatibility
+                        )
+                        pbar.update(len(images))
+                        logging.info(f"Successfully converted {len(images)} pages for PaddleOCR")
+                    except Exception as e:
+                        logging.error(f"PDF to image conversion failed: {e}")
+                        return ""
+                    
+                # Process each image with PaddleOCR
+                with tqdm(total=len(images), desc="PaddleOCR processing", unit="page") as pbar:
+                    for i, image in enumerate(images, 1):
+                        try:
+                            # Save image to memory buffer to ensure proper format
+                            img_buffer = io.BytesIO()
+                            image.save(img_buffer, format="JPEG")
+                            img_buffer.seek(0)
+                            
+                            # Load from buffer to ensure clean image
+                            pil_img = Image.open(img_buffer)
+                            
+                            # Debug info about image
+                            logging.debug(f"Processing image for page {i}: size={pil_img.size}, mode={pil_img.mode}")
+                            
+                            # Process with PaddleOCR using the direct image object
+                            try:
+                                # First try with direct PIL image
+                                result = paddle_ocr.ocr(pil_img, cls=True)
+                                logging.debug(f"PaddleOCR result type: {type(result)}")
+                                if result:
+                                    logging.debug(f"Result length: {len(result)}")
+                            except Exception as direct_error:
+                                logging.debug(f"Direct PIL processing failed: {direct_error}")
+                                # Fall back to numpy array
+                                try:
+                                    img_array = np.array(pil_img)
+                                    result = paddle_ocr.ocr(img_array, cls=True)
+                                except Exception as numpy_error:
+                                    logging.error(f"Numpy array processing also failed: {numpy_error}")
+                                    pbar.update(1)
+                                    if progress_callback:
+                                        progress_callback(1)
+                                    continue
+                            
+                            # Extract text with detailed debugging
+                            page_text = []
+                            
+                            # Handle the result with extensive error checking
+                            if result is not None:
+                                logging.debug(f"Result is not None, type: {type(result)}")
+                                
+                                # Check if result is list of pages
+                                if isinstance(result, list):
+                                    for idx, page_result in enumerate(result):
+                                        logging.debug(f"Processing page result {idx}, type: {type(page_result)}")
+                                        
+                                        if page_result is not None and isinstance(page_result, list):
+                                            for line_idx, line in enumerate(page_result):
+                                                logging.debug(f"Processing line {line_idx}, type: {type(line)}")
+                                                
+                                                # Try different formats
+                                                try:
+                                                    # Format: [[points], (text, confidence)]
+                                                    if (isinstance(line, list) and len(line) == 2 and 
+                                                        isinstance(line[1], tuple) and len(line[1]) == 2):
+                                                        
+                                                        text, confidence = line[1]
+                                                        logging.debug(f"Found text: '{text}', confidence: {confidence}")
+                                                        
+                                                        if confidence > 0.5:  # Use a lower threshold for better recall
+                                                            page_text.append(text)
+                                                            
+                                                    # Format: [points, [text, confidence]]
+                                                    elif (isinstance(line, list) and len(line) == 2 and 
+                                                        isinstance(line[1], list) and len(line[1]) == 2):
+                                                        
+                                                        text, confidence = line[1]
+                                                        logging.debug(f"Found text (alternate format): '{text}', confidence: {confidence}")
+                                                        
+                                                        if confidence > 0.5:
+                                                            page_text.append(text)
+                                                            
+                                                    # Legacy format: [text, confidence]
+                                                    elif (isinstance(line, list) and len(line) == 2 and 
+                                                        isinstance(line[0], str) and isinstance(line[1], float)):
+                                                        
+                                                        text, confidence = line
+                                                        logging.debug(f"Found text (legacy format): '{text}', confidence: {confidence}")
+                                                        
+                                                        if confidence > 0.5:
+                                                            page_text.append(text)
+                                                            
+                                                    else:
+                                                        logging.debug(f"Unknown result format: {line}")
+                                                        
+                                                except Exception as format_error:
+                                                    logging.debug(f"Error extracting text from line: {format_error}")
+                                                    continue
+                            
+                            # Join text with newlines and add to overall result
+                            if page_text:
+                                text_parts.append('\n'.join(page_text))
+                                logging.debug(f"Successfully extracted {len(page_text)} text lines from page {i}")
+                            else:
+                                logging.warning(f"No text extracted from page {i} with English model")
+                                
+                                # Try with German language model as fallback
+                                try:
+                                    # Lazy initialize German model
+                                    if not hasattr(self, '_paddleocr_german'):
+                                        try:
+                                            from paddleocr import PaddleOCR
+                                            self._paddleocr_german = PaddleOCR(
+                                                use_angle_cls=True,
+                                                lang='german',
+                                                use_gpu=False,
+                                                show_log=False,
+                                                ocr_version='PP-OCRv3'  # Use v3 for better German support
+                                            )
+                                            logging.info("German PaddleOCR model initialized")
+                                        except Exception as ge:
+                                            logging.warning(f"Failed to initialize German model: {ge}")
+                                    
+                                    # Use German model if available
+                                    if hasattr(self, '_paddleocr_german'):
+                                        try:
+                                            german_result = self._paddleocr_german.ocr(pil_img, cls=True)
+                                            german_text = self._extract_paddleocr_text(german_result, min_confidence=0.4)
+                                            
+                                            if german_text:
+                                                text_parts.append('\n'.join(german_text))
+                                                logging.debug(f"Extracted {len(german_text)} text lines with German model")
+                                            else:
+                                                logging.warning(f"No text extracted with German model either")
+                                        except Exception as ge2:
+                                            logging.error(f"German model processing failed: {ge2}")
+                                except Exception as ge3:
+                                    logging.error(f"Error in German fallback: {ge3}")
+                            
+                            # Update progress
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                            
+                            # Clean up resources
+                            img_buffer.close()
+                                
+                        except Exception as e:
+                            logging.error(f"PaddleOCR failed on page {i}: {e}")
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                        finally:
+                            # Clean up resources
+                            try:
+                                if image:
+                                    image.close()
+                            except:
+                                pass
+                                
+                # Return combined text
+                if text_parts:
+                    return '\n\n'.join(text_parts)
+                else:
+                    logging.warning("No text extracted with PaddleOCR")
                     return ""
                     
-                if progress_callback:
-                    # Signal completion
-                    progress_callback(len(doc))
-                    
-                return "\n\n".join(text_parts)
-                
             except Exception as e:
-                logging.error(f"DocTR prediction failed: {e}")
+                logging.error(f"PaddleOCR processing error: {e}")
                 return ""
                 
         except Exception as e:
-            logging.error(f"DocTR extraction failed: {e}")
+            logging.error(f"PaddleOCR extraction failed: {e}")
             return ""
-        finally:
-            self._clear_gpu_memory()
 
+    def _extract_paddleocr_text(self, result, min_confidence=0.5):
+        """Helper method to extract text from PaddleOCR result with flexible format handling"""
+        extracted_text = []
+        
+        try:
+            if result is None:
+                return extracted_text
+                
+            # Handle result as list of pages
+            if isinstance(result, list):
+                for page_idx, page_result in enumerate(result):
+                    if page_result is None:
+                        continue
+                        
+                    if isinstance(page_result, list):
+                        for line in page_result:
+                            try:
+                                # Try multiple possible formats
+                                
+                                # Format: [[points], (text, confidence)]
+                                if (isinstance(line, list) and len(line) == 2 and 
+                                    isinstance(line[1], tuple) and len(line[1]) == 2):
+                                    
+                                    text, confidence = line[1]
+                                    if text and confidence > min_confidence:
+                                        extracted_text.append(text)
+                                        
+                                # Format: [points, [text, confidence]]
+                                elif (isinstance(line, list) and len(line) == 2 and 
+                                    isinstance(line[1], list) and len(line[1]) == 2):
+                                    
+                                    text, confidence = line[1]
+                                    if text and confidence > min_confidence:
+                                        extracted_text.append(text)
+                                        
+                                # Legacy format: [text, confidence]
+                                elif (isinstance(line, list) and len(line) == 2 and 
+                                    isinstance(line[0], str) and isinstance(line[1], float)):
+                                    
+                                    text, confidence = line
+                                    if text and confidence > min_confidence:
+                                        extracted_text.append(text)
+                            except Exception:
+                                # Skip this line if extraction fails
+                                continue
+        except Exception:
+            # Return whatever we managed to extract so far
+            pass
+            
+        return extracted_text
+
+    def extract_with_kraken_cli(self, pdf_path: str, progress_callback=None) -> str:
+        """
+        Extract text using the Kraken CLI instead of the Python API.
+        This avoids TensorFlow compatibility issues.
+        
+        Args:
+            pdf_path: Path to PDF file
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            str: Extracted text
+        """
+        # Check if kraken CLI is available
+        kraken_bin = shutil.which('kraken')
+        if not kraken_bin:
+            logging.warning("kraken command not found in PATH. Please install kraken CLI.")
+            self._ocr_failed_methods.add('kraken_cli')
+            return ""
+        
+        try:
+            # Import pdf2image to convert PDF to images
+            pdf2image = self._import_cache.import_module('pdf2image')
+            import tempfile
+            import os
+            import subprocess
+            import platform
+            
+            # Create a temporary directory to store images and results
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Convert PDF to images
+                logging.info(f"Converting PDF to images for Kraken CLI processing")
+                with tqdm(desc="Converting PDF to images", unit="page") as pbar:
+                    try:
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            dpi=300,
+                            thread_count=1,
+                            grayscale=True,
+                            output_folder=temp_dir,
+                            fmt="png"
+                        )
+                        pbar.update(len(images))
+                        logging.info(f"Successfully converted {len(images)} pages to images")
+                    except Exception as e:
+                        logging.error(f"PDF to image conversion failed: {e}")
+                        return ""
+                
+                # Find all converted images in the temp directory
+                image_paths = sorted([os.path.join(temp_dir, f) for f in os.listdir(temp_dir) 
+                                if f.endswith('.png')])
+                
+                if not image_paths:
+                    logging.error("No images were created from the PDF")
+                    return ""
+                
+                # Process each image with Kraken CLI
+                text_parts = []
+                
+                # Check if we're on Windows to handle command line differences
+                is_windows = platform.system() == 'Windows'
+                
+                with tqdm(total=len(image_paths), desc="Kraken CLI processing", unit="page") as pbar:
+                    for i, img_path in enumerate(image_paths, 1):
+                        try:
+                            # Create output file paths
+                            txt_output = os.path.join(temp_dir, f"page_{i}.txt")
+                            
+                            # Prepare command - use one-step process following the docs
+                            # "kraken -i image.tif image.txt segment -bl ocr -m model.mlmodel"
+                            ocr_cmd = [
+                                kraken_bin,
+                                "-i", img_path,
+                                txt_output,
+                                "segment", "-bl", 
+                                "ocr"
+                            ]
+                            
+                            # Check if we have a model to use
+                            model_path = None
+                            # First check user's home directory for default model
+                            model_locations = [
+                                os.path.expanduser("~/.local/share/kraken/10.5281_zenodo.10592716.mlmodel"),
+                                os.path.expanduser("~/.kraken/10.5281_zenodo.10592716.mlmodel"),
+                                # Add Windows locations
+                                os.path.join(os.path.expanduser("~"), "AppData", "Local", "kraken", "10.5281_zenodo.10592716.mlmodel"),
+                                # Add specific path if you know where kraken stores models
+                            ]
+                            
+                            for loc in model_locations:
+                                if os.path.exists(loc):
+                                    model_path = loc
+                                    break
+                                    
+                            if model_path:
+                                ocr_cmd.extend(["-m", model_path])
+                            else:
+                                # Try to download the model first if it doesn't exist
+                                try:
+                                    download_cmd = [kraken_bin, "get", "10.5281/zenodo.10592716"]
+                                    logging.info("Downloading default Kraken model...")
+                                    
+                                    # On Windows, use different shell settings
+                                    if is_windows:
+                                        download_process = subprocess.run(
+                                            download_cmd,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            text=True,
+                                            shell=True  # Use shell on Windows
+                                        )
+                                    else:
+                                        download_process = subprocess.run(
+                                            download_cmd,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            text=True
+                                        )
+                                    
+                                    if download_process.returncode == 0:
+                                        # Check again for the model
+                                        for loc in model_locations:
+                                            if os.path.exists(loc):
+                                                model_path = loc
+                                                ocr_cmd.extend(["-m", model_path])
+                                                break
+                                    else:
+                                        logging.warning(f"Failed to download model: {download_process.stderr}")
+                                except Exception as download_error:
+                                    logging.warning(f"Error downloading model: {download_error}")
+                            
+                            # Run OCR command with appropriate shell settings for platform
+                            logging.debug(f"Running kraken OCR command: {' '.join(ocr_cmd)}")
+                            try:
+                                if is_windows:
+                                    ocr_process = subprocess.run(
+                                        ocr_cmd,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        text=True,
+                                        check=False,  # Don't raise exception on error
+                                        shell=True    # Use shell on Windows
+                                    )
+                                else:
+                                    ocr_process = subprocess.run(
+                                        ocr_cmd,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        text=True,
+                                        check=False  # Don't raise exception on error
+                                    )
+                                
+                                if ocr_process.returncode != 0:
+                                    logging.error(f"Kraken OCR failed: {ocr_process.stderr}")
+                                    
+                                    # Try an alternative approach based on the docs
+                                    logging.info("Trying alternative Kraken command syntax...")
+                                    
+                                    alt_cmd = [
+                                        kraken_bin,
+                                        "-i", img_path,
+                                        txt_output,
+                                        "binarize", "segment", "ocr"
+                                    ]
+                                    
+                                    if model_path:
+                                        alt_cmd.extend(["-m", model_path])
+                                    
+                                    if is_windows:
+                                        alt_process = subprocess.run(
+                                            alt_cmd,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            text=True,
+                                            shell=True
+                                        )
+                                    else:
+                                        alt_process = subprocess.run(
+                                            alt_cmd,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            text=True
+                                        )
+                                    
+                                    if alt_process.returncode != 0:
+                                        logging.error(f"Alternative Kraken command failed: {alt_process.stderr}")
+                                        continue
+                                
+                            except Exception as proc_error:
+                                logging.error(f"Error running Kraken command: {proc_error}")
+                                continue
+                            
+                            # Read the OCR result if the file exists
+                            if os.path.exists(txt_output):
+                                try:
+                                    with open(txt_output, 'r', encoding='utf-8') as f:
+                                        page_text = f.read().strip()
+                                        if page_text:
+                                            text_parts.append(page_text)
+                                            logging.debug(f"Successfully extracted text from page {i}")
+                                        else:
+                                            logging.warning(f"No text extracted from page {i}")
+                                except Exception as read_error:
+                                    logging.error(f"Error reading OCR result: {read_error}")
+                            else:
+                                logging.warning(f"Output file not created: {txt_output}")
+                            
+                            # Update progress
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                                
+                        except Exception as e:
+                            logging.error(f"Error processing page {i}: {e}")
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                
+                # Combine the text from all pages
+                if text_parts:
+                    return '\n\n'.join(text_parts)
+                else:
+                    logging.warning("No text extracted with Kraken CLI")
+                    return ""
+                    
+        except Exception as e:
+            logging.error(f"Kraken CLI extraction failed: {e}")
+            # Add to failed methods so we don't try again
+            self._ocr_failed_methods.add('kraken_cli')
+            return ""
 
 
     def extract_with_kraken(self, pdf_path: str, progress_callback=None) -> str:
         """
-        Extract text using Kraken with correct API usage.
+        Extract text using Kraken following the structure of the documentation.
         
         Args:
             pdf_path: Path to PDF file
@@ -2317,82 +3383,189 @@ class PDFExtractor:
             str: Extracted text
         """
         if not self._init_ocr('kraken'):
+            logging.warning("Kraken initialization failed, skipping Kraken OCR")
             return ""
         
         # Import minimal dependencies
-        pdf2image = self._import_cache.import_module('pdf2image') 
+        pdf2image = self._import_cache.import_module('pdf2image')
         
         text_parts = []
         images = None
             
         try:
-            # Convert PDF to images (this is thread-safe)
+            # Convert PDF to images
             with tqdm(desc="Converting PDF to images for Kraken", unit="page") as pbar:
                 images = pdf2image.convert_from_path(
                     pdf_path,
                     dpi=300,
-                    thread_count=1,  # Use single thread for conversion
+                    thread_count=1,
                     grayscale=True
                 )
                 pbar.update(len(images))
             
-            # Process images with safer approach
+            # Process images
             with tqdm(total=len(images), desc="Kraken processing", unit="page") as pbar:
-                # Import kraken correctly
-                import kraken
+                # Import kraken
+                try:
+                    import kraken
+                    from kraken import binarization, pageseg, rpred
+                    from kraken.lib import models
+                except Exception as kraken_import_error:
+                    logging.error(f"Failed to import Kraken modules: {kraken_import_error}")
+                    # Add to failed methods so we don't try again
+                    self._ocr_failed_methods.add('kraken')
+                    return ""
                 
+                # Try to load a model first - exact steps from documentation
+                model = None
+                try:
+                    # Try direct load using the documented approach
+                    model_path = None
+                    
+                    # Check if there's a get_default_model function
+                    if hasattr(rpred, 'get_default_model'):
+                        try:
+                            model_path = rpred.get_default_model()
+                            logging.debug(f"Found default model path: {model_path}")
+                        except Exception as path_error:
+                            logging.debug(f"Error getting default model path: {path_error}")
+                    
+                    # If we found a model path, try to load it
+                    if model_path:
+                        try:
+                            # Using documented approach for model loading
+                            model = models.load_any(model_path)
+                            logging.info(f"Successfully loaded model: {type(model)}")
+                        except Exception as model_error:
+                            logging.debug(f"Error loading model: {model_error}")
+                except Exception as e:
+                    logging.debug(f"Error in model loading: {e}")
+                    
+                # Process each image
                 for i, image in enumerate(images, 1):
                     try:
-                        # Use correct Kraken API modules based on documentation
-                        # First binarize the image
-                        binarized = kraken.binarization.nlbin(image)
-                        
-                        # Segment the image
-                        segments = kraken.pageseg.segment(binarized)
-                        
-                        # Perform text recognition if available
+                        # Guard against TensorFlow errors
                         try:
-                            # Use the rpred module directly as shown in docs
-                            if hasattr(kraken, 'rpred'):
-                                # Simple model-less recognition for testing
-                                text = kraken.rpred.rpred(None, image, segments)
-                                if text:
-                                    text_parts.append(text)
-                                else:
-                                    text_parts.append(f"[Kraken extracted {len(segments['boxes'])} text segments]")
-                        except Exception as recog_error:
-                            if self._debug:
-                                logging.debug(f"Kraken recognition error: {recog_error}")
-                            # Fall back to simple text extraction from segments
-                            text_parts.append(f"[Kraken extracted {len(segments['boxes'])} text segments]")
+                            # Step 1: Binarize the image - directly following the docs
+                            bw_im = binarization.nlbin(image)
+                            logging.debug(f"Binarization successful on page {i}")
+                            
+                            # Step 2: Segment the image - directly following the docs
+                            seg = pageseg.segment(bw_im)
+                            logging.debug(f"Segmentation successful: {type(seg)}")
+                            
+                            # Get number of lines detected
+                            if hasattr(seg, 'lines'):
+                                lines = seg.lines
+                                line_count = len(lines)
+                                logging.debug(f"Found {line_count} lines on page {i}")
+                            else:
+                                line_count = 0
+                                logging.warning(f"No text lines found on page {i}")
+                            
+                            # Step 3: Recognition - directly following the docs
+                            if line_count > 0:
+                                try:
+                                    # Exactly as in the documentation
+                                    pred_it = rpred(
+                                        network=model,  # Can be None as the docs suggest default model is used
+                                        im=bw_im,
+                                        bounds=seg  # Using the segmentation result directly
+                                    )
+                                    
+                                    # Process prediction records
+                                    page_text_parts = []
+                                    
+                                    # Process results following docs example
+                                    try:
+                                        for record in pred_it:
+                                            if hasattr(record, 'prediction') and record.prediction:
+                                                page_text_parts.append(record.prediction)
+                                                logging.debug(f"Extracted: {record.prediction[:30]}...")
+                                    except Exception as pred_error:
+                                        logging.debug(f"Error processing predictions: {pred_error}")
+                                    
+                                    # Add extracted text from this page
+                                    if page_text_parts:
+                                        page_text = "\n".join(page_text_parts)
+                                        text_parts.append(page_text)
+                                        logging.debug(f"Successfully extracted text from page {i}: {len(page_text)} chars")
+                                    else:
+                                        logging.warning(f"No text extracted from page {i} despite {line_count} lines")
+                                        # Add placeholder if no text extracted
+                                        text_parts.append(f"[Page {i}: Found {line_count} text regions but extraction failed]")
+                                except Exception as recog_error:
+                                    # Check for TensorFlow errors
+                                    if "tensorflow" in str(recog_error).lower() or "register_load_context_function" in str(recog_error):
+                                        logging.error(f"TensorFlow error with Kraken OCR: {recog_error}")
+                                        # Add to failed methods so we don't try again
+                                        self._ocr_failed_methods.add('kraken')
+                                        return ""
+                                    
+                                    logging.debug(f"Recognition error on page {i}: {recog_error}")
+                                    # Add placeholder if recognition failed
+                                    text_parts.append(f"[Page {i}: Found {line_count} text regions but recognition failed: {recog_error}]")
+                            else:
+                                # Add placeholder if no lines found
+                                text_parts.append(f"[Page {i}: No text regions found]")
                         
+                        except Exception as tensorflow_error:
+                            # Check for TensorFlow errors
+                            if "tensorflow" in str(tensorflow_error).lower() or "register_load_context_function" in str(tensorflow_error):
+                                logging.error(f"TensorFlow error in Kraken OCR: {tensorflow_error}")
+                                # Add to failed methods so we don't try again
+                                self._ocr_failed_methods.add('kraken')
+                                return ""
+                            raise  # Re-raise other errors to be caught by the outer try block
+                        
+                        # Update progress
                         pbar.update(1)
                         if progress_callback:
                             progress_callback(1)
                             
                     except Exception as e:
-                        logging.error(f"Kraken failed on page {i}: {e}")
-                        continue
+                        logging.error(f"Kraken processing failed on page {i}: {e}")
+                        # Add error placeholder
+                        text_parts.append(f"[Page {i}: Processing error: {e}]")
+                        pbar.update(1)
+                        if progress_callback:
+                            progress_callback(1)
                     finally:
-                        image.close()
-                        
+                        # Clean up
+                        try:
+                            image.close()
+                        except:
+                            pass
+            
+            # Return joined text if any was extracted
+            if text_parts:
+                return '\n\n'.join(text_parts)
+            else:
+                logging.warning("No text extracted with Kraken")
+                return ""
+                
         except Exception as e:
+            # Check for TensorFlow-specific errors
+            if "tensorflow" in str(e).lower() or "register_load_context_function" in str(e):
+                logging.error(f"TensorFlow compatibility issue with Kraken: {e}")
+                # Add to failed methods so we don't try again
+                self._ocr_failed_methods.add('kraken')
+                return ""
+                
             logging.error(f"Kraken extraction failed: {e}")
             return ""
         finally:
-            if images:
+            # Clean up
+            if 'images' in locals() and images:
                 for img in images:
                     try:
                         img.close()
                     except:
                         pass
-            
-        return '\n\n'.join(text_parts)
-
 
     def extract_with_easyocr(self, pdf_path: str, progress_callback=None) -> str:
         """
-        Extract text using EasyOCR with proper API.
+        Extract text using EasyOCR with proper image handling.
         
         Args:
             pdf_path: Path to PDF file
@@ -2407,19 +3580,19 @@ class PDFExtractor:
         try:
             # Import required dependencies here to ensure they're available
             pdf2image = self._import_cache.import_module('pdf2image')
-            import torch  # Add explicit torch import here
+            import numpy as np
             
             text_parts = []
             images = None
             
             try:
-                # Convert PDF to images (thread-safe)
+                # Convert PDF to images
                 with tqdm(desc="Converting PDF to images for EasyOCR", unit="page") as pbar:
                     images = pdf2image.convert_from_path(
                         pdf_path,
                         dpi=300,
                         thread_count=1,  # Single thread for stability
-                        grayscale=True
+                        grayscale=False   # EasyOCR works better with color images
                     )
                     pbar.update(len(images))
                 
@@ -2430,6 +3603,7 @@ class PDFExtractor:
                 # Initialize reader with English as default language
                 try:
                     if not hasattr(self, '_reader') or self._reader is None:
+                        import torch
                         reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
                         self._reader = reader
                     else:
@@ -2442,9 +3616,12 @@ class PDFExtractor:
                 with tqdm(total=len(images), desc="EasyOCR processing", unit="page") as pbar:
                     for i, image in enumerate(images, 1):
                         try:
+                            # Convert PIL image to numpy array (this is what EasyOCR expects)
+                            img_array = np.array(image)
+                            
                             # Process page using EasyOCR
                             results = reader.readtext(
-                                image,
+                                img_array,
                                 detail=0,  # Just get the text
                                 paragraph=True  # Combine text into paragraphs
                             )
@@ -2462,7 +3639,11 @@ class PDFExtractor:
                         except Exception as e:
                             logging.error(f"EasyOCR failed on page {i}: {e}")
                         finally:
-                            image.close()
+                            # Make sure to close the image
+                            try:
+                                image.close()
+                            except:
+                                pass
                             
             finally:
                 # Clean up resources
@@ -2537,78 +3718,228 @@ class PDFExtractor:
                             logging.debug(f"Tesseract initialization error: {e}")
                         self._ocr_initialized[method] = False
                         return False
+                    
+                elif method == 'paddleocr':
+                    try:
+                        # Check if paddleocr is available
+                        if not self._import_cache.is_available('paddleocr'):
+                            if self._debug:
+                                logging.debug("PaddleOCR package not available")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Import paddleocr
+                        from paddleocr import PaddleOCR
+                        
+                        # Initialize the OCR engine with English and German languages
+                        self._paddleocr = PaddleOCR(use_angle_cls=True, lang='en', 
+                                                    ocr_version='PP-OCRv4')
+                        
+                        # Store in cache
+                        self._ocr_initialized[method] = True
+                        logging.info("PaddleOCR initialized successfully")
+                        return True
+                        
+                    except ImportError as e:
+                        logging.warning(f"PaddleOCR import error: {e}")
+                        self._ocr_initialized[method] = False
+                        return False
+                    except Exception as e:
+                        logging.warning(f"PaddleOCR initialization error: {e}")
+                        self._ocr_initialized[method] = False
+                        return False
                         
                 elif method == 'doctr':
+                    
                     try:
-                        # Check if doctr is importable without initializing models
+                        # Check if doctr is available with better error reporting
                         if not self._import_cache.is_available('doctr'):
-                            if self._debug:
-                                logging.debug("DocTR not available")
+                            logging.warning("DocTR package not available")
                             self._ocr_initialized[method] = False
                             return False
                         
-                        # Import doctr without initializing models
+                        # Import doctr and verify required modules
                         import doctr
                         
-                        # Check if doctr has the required modules
-                        if not hasattr(doctr, 'io') or not hasattr(doctr, 'models'):
-                            if self._debug:
-                                logging.debug("DocTR missing required modules")
+                        # Log doctr version
+                        try:
+                            logging.info(f"DocTR version: {doctr.__version__}")
+                        except:
+                            logging.info("DocTR installed but version unknown")
+                        
+                        # Check for essential modules
+                        required_modules = ['io', 'models', 'utils']
+                        missing_modules = []
+                        
+                        for module_name in required_modules:
+                            if not hasattr(doctr, module_name):
+                                missing_modules.append(module_name)
+                        
+                        if missing_modules:
+                            logging.warning(f"DocTR missing required modules: {', '.join(missing_modules)}")
                             self._ocr_initialized[method] = False
                             return False
+                        
+                        # Check for required PyTorch installation
+                        try:
+                            import torch
+                            logging.info(f"PyTorch version: {torch.__version__}")
+                            
+                            # Check CUDA availability - not required but good to know
+                            if torch.cuda.is_available():
+                                logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+                            else:
+                                logging.info("CUDA not available, using CPU")
+                                
+                        except ImportError:
+                            logging.warning("PyTorch not available - DocTR might not work correctly")
                         
                         # Store module references
                         self._doctr = doctr
                         
-                        # Mark as initialized with deferred model loading
+                        # Log success
+                        logging.info("DocTR initialized successfully")
+                        
+                        # Store in cache
                         self._ocr_initialized[method] = True
-                        self._doctr_predictor_loaded = False
                         return True
-                            
+                        
                     except ImportError as e:
+                        logging.warning(f"DocTR import error: {e}")
+                        self._ocr_initialized[method] = False
+                        self._ocr_failed_methods.add(method)
+                        return False
+                    except Exception as e:
+                        logging.warning(f"DocTR initialization error: {e}")
+                        self._ocr_initialized[method] = False
+                        self._ocr_failed_methods.add(method)
+                        return False
+                    
+                elif method == 'kraken_cli':
+                    # Check if the kraken CLI is available
+                    kraken_bin = shutil.which('kraken')
+                    if not kraken_bin:
                         if self._debug:
-                            logging.debug(f"DocTR import error: {e}")
+                            logging.debug("Kraken CLI not found in PATH")
+                        self._ocr_initialized[method] = False
+                        return False
+                    
+                    # Check if pdf2image is available (needed to convert PDFs to images)
+                    try:
+                        import pdf2image
+                        self._pdf2image = pdf2image
+                        
+                        # Successfully initialized
+                        self._ocr_initialized[method] = True
+                        if self._debug:
+                            logging.debug(f"Found Kraken CLI at: {kraken_bin}")
+                        return True
+                    except ImportError:
+                        if self._debug:
+                            logging.debug("pdf2image not available, required for Kraken CLI")
                         self._ocr_initialized[method] = False
                         return False
                         
                 elif method == 'kraken':
-                    # Check for kraken availability
-                    if not self._import_cache.is_available('kraken'):
-                        if self._debug:
-                            logging.debug("Kraken not available")
-                        self._ocr_initialized[method] = False
-                        return False
-                    
+                    # thorough check for kraken availability
                     try:
-                        # Import kraken correctly based on documentation
-                        import kraken
-                        
-                        # Check for the necessary modules according to docs
-                        has_binarization = hasattr(kraken, 'binarization')
-                        has_pageseg = hasattr(kraken, 'pageseg')
-                        has_rpred = hasattr(kraken, 'rpred')
-                        
-                        if not (has_binarization and has_pageseg and has_rpred):
+                        # First verify the package is importable
+                        if not self._import_cache.is_available('kraken'):
                             if self._debug:
-                                logging.debug("Missing one or more Kraken modules")
+                                logging.debug("Kraken package not available")
                             self._ocr_initialized[method] = False
                             return False
                         
-                        # Store modules for later use
-                        self._kraken = kraken
-                        self._kraken_binarization = kraken.binarization
-                        self._kraken_pageseg = kraken.pageseg
-                        self._kraken_rpred = kraken.rpred
+                        # Check for TensorFlow compatibility before importing kraken
+                        try:
+                            import tensorflow as tf
+                            # Check for the specific attribute that's causing the error
+                            if not hasattr(tf._api.v2.compat.v2.__internal__, 'register_load_context_function'):
+                                logging.warning("Detected incompatible TensorFlow version for Kraken OCR")
+                                self._ocr_initialized[method] = False
+                                self._ocr_failed_methods.add(method)
+                                return False
+                        except (ImportError, AttributeError) as tf_error:
+                            # TensorFlow not available or has compatibility issues
+                            logging.debug(f"TensorFlow compatibility check failed: {tf_error}")
+                            # Continue with Kraken import attempt - it might work with other backends
                         
-                        # Mark as initialized with deferred model loading
-                        self._ocr_initialized[method] = True
-                        self._kraken_model_loaded = False
-                        return True
+                        # Import kraken explicitly
+                        import kraken
+                        
+                        # Check if specific modules are available
+                        required_modules = []
+                        
+                        # Check which module structure is used based on version
+                        try:
+                            # Try importing kraken.binarization
+                            from kraken import binarization
+                            required_modules.append('binarization')
+                        except ImportError:
+                            pass
                             
+                        try:
+                            # Try importing kraken.pageseg
+                            from kraken import pageseg
+                            required_modules.append('pageseg')
+                        except ImportError:
+                            pass
+                            
+                        try:
+                            # Try importing kraken.recognition
+                            from kraken import recognition
+                            required_modules.append('recognition')
+                        except ImportError:
+                            # Try older module structure
+                            try:
+                                from kraken import rpred
+                                required_modules.append('rpred')
+                            except ImportError:
+                                pass
+                        
+                        # If no modules found, we can't use kraken
+                        if not required_modules:
+                            logging.debug("No usable Kraken modules found")
+                            self._ocr_initialized[method] = False
+                            return False
+                        
+                        # Log which module structure we found
+                        logging.debug(f"Found Kraken modules: {', '.join(required_modules)}")
+                        
+                        # Store the kraken module and the required submodules
+                        self._kraken = kraken
+                        
+                        # Store individual module references
+                        if 'binarization' in required_modules:
+                            self._kraken_binarization = binarization
+                        if 'pageseg' in required_modules:
+                            self._kraken_pageseg = pageseg
+                        if 'recognition' in required_modules:
+                            self._kraken_recognition = recognition
+                        elif 'rpred' in required_modules:
+                            self._kraken_rpred = rpred
+                        
+                        # Mark as initialized
+                        self._ocr_initialized[method] = True
+                        return True
+                        
                     except ImportError as e:
                         if self._debug:
                             logging.debug(f"Kraken import error: {e}")
                         self._ocr_initialized[method] = False
+                        self._ocr_failed_methods.add(method)
+                        return False
+                    except Exception as e:
+                        # Catch TensorFlow-specific errors
+                        if "tensorflow" in str(e).lower() or "register_load_context_function" in str(e):
+                            logging.warning(f"TensorFlow compatibility issue with Kraken: {e}")
+                            self._ocr_initialized[method] = False
+                            self._ocr_failed_methods.add(method)
+                            return False
+                        if self._debug:
+                            logging.debug(f"Unexpected error initializing Kraken: {e}")
+                        self._ocr_initialized[method] = False
+                        self._ocr_failed_methods.add(method)
                         return False
                         
                 elif method == 'easyocr':
@@ -2656,7 +3987,7 @@ class PDFExtractor:
 
 
     def extract_with_tesseract(self, pdf_path: str, progress_callback=None) -> str:
-        """Extract text using Tesseract OCR with progress bars"""
+        """Extract text using Tesseract OCR without signal handlers in worker threads"""
         # First verify tesseract is actually available
         if 'tesseract' not in self._initialized_methods:
             logging.error("Tesseract not available in initialized methods")
@@ -2668,21 +3999,61 @@ class PDFExtractor:
         
         text_parts = []
         images = None
+        processes = []  # Track any launched subprocesses
+        
+        # Check if we're in the main thread - signal handlers only work there
+        in_main_thread = threading.current_thread() is threading.main_thread()
         
         try:
+            # Only set up signal handlers if we're in the main thread
+            original_sigint_handler = None
+            original_sigterm_handler = None
+            
+            if in_main_thread:
+                original_sigint_handler = signal.getsignal(signal.SIGINT)
+                original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+                
+                def custom_signal_handler(signum, frame):
+                    """Custom signal handler to terminate tesseract processes"""
+                    logging.info(f"Received signal {signum}, cleaning up tesseract processes...")
+                    
+                    # Try to terminate any running tesseract processes
+                    for proc in processes:
+                        if proc and proc.poll() is None:  # If process exists and is still running
+                            try:
+                                proc.terminate()
+                                logging.info(f"Terminated tesseract process {proc.pid}")
+                            except Exception as e:
+                                logging.error(f"Failed to terminate process: {e}")
+                    
+                    # Restore original signal handlers
+                    signal.signal(signal.SIGINT, original_sigint_handler)
+                    signal.signal(signal.SIGTERM, original_sigterm_handler)
+                    
+                    # Raise KeyboardInterrupt to properly exit
+                    raise KeyboardInterrupt("OCR interrupted by user")
+                
+                # Set custom signal handlers
+                signal.signal(signal.SIGINT, custom_signal_handler)
+                signal.signal(signal.SIGTERM, custom_signal_handler)
+            
             # Convert PDF to images with progress bar
             with tqdm(desc="Converting PDF to images for tesseract", unit="page") as pbar:
                 try:
+                    # Use thread_count=1 for better interrupt handling
                     images = pdf2image.convert_from_path(
                         pdf_path,
                         dpi=300,
-                        thread_count=1,  # Use single thread for stability
+                        thread_count=1,  # Use single thread for stability and interrupt handling
                         grayscale=True,
                         size=(None, 2000),  # Limit height for memory
                         use_cropbox=True,   # Use cropbox for extraction
                         strict=False        # Continue even with errors
                     )
                     pbar.update(len(images))
+                except KeyboardInterrupt:
+                    logging.info("PDF conversion interrupted by user")
+                    raise
                 except Exception as e:
                     logging.error(f"PDF to image conversion failed: {e}")
                     # Try alternative conversion options
@@ -2698,6 +4069,9 @@ class PDFExtractor:
                             strict=False
                         )
                         pbar.update(len(images))
+                    except KeyboardInterrupt:
+                        logging.info("Alternative conversion interrupted by user")
+                        raise
                     except Exception as e2:
                         logging.error(f"Alternative conversion also failed: {e2}")
                         return ""
@@ -2706,11 +4080,43 @@ class PDFExtractor:
             with tqdm(total=len(images), desc="OCR Processing with tesseract", unit="page") as pbar:
                 for i, image in enumerate(images, 1):
                     try:
+                        # Get tesseract process info for better interrupt handling
+                        # First check if we're using pytesseract.pytesseract.run_tesseract
+                        original_run_tesseract = None
+                        tesseract_process = None
+                        
+                        # Monkey patch pytesseract to capture the subprocess only if in main thread
+                        if in_main_thread and hasattr(pytesseract, 'pytesseract') and hasattr(pytesseract.pytesseract, 'run_tesseract'):
+                            original_run_tesseract = pytesseract.pytesseract.run_tesseract
+                            
+                            def patched_run_tesseract(input_filename, output_filename_base, extension, lang, config=''):
+                                cmd = [
+                                    pytesseract.pytesseract.tesseract_cmd,
+                                    input_filename,
+                                    output_filename_base,
+                                    *(['-l', lang] if lang else []),
+                                    *shlex.split(config),
+                                ]
+                                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                                processes.append(proc)  # Add to our list of processes
+                                status = proc.wait()
+                                error_string = proc.stderr.read().decode('utf-8').strip()
+                                processes.remove(proc)  # Remove from our process list
+                                return status, error_string
+                            
+                            pytesseract.pytesseract.run_tesseract = patched_run_tesseract
+                        
                         # OCR with optimized settings
-                        text = pytesseract.image_to_string(
-                            image,
-                            config='--oem 3 --psm 3 -l eng',  # Specify language and PSM mode
-                        )
+                        try:
+                            text = pytesseract.image_to_string(
+                                image,
+                                config='--oem 3 --psm 3 -l eng',  # Specify language and PSM mode
+                                # try deu+eng instead
+                            )
+                        finally:
+                            # Restore original function if we patched it
+                            if in_main_thread and original_run_tesseract:
+                                pytesseract.pytesseract.run_tesseract = original_run_tesseract
                         
                         if text.strip():
                             text_parts.append(text.strip())
@@ -2719,6 +4125,9 @@ class PDFExtractor:
                         if progress_callback:
                             progress_callback(1)
                             
+                    except KeyboardInterrupt:
+                        logging.info(f"OCR interrupted on page {i}")
+                        raise
                     except Exception as e:
                         logging.error(f"OCR failed on page {i}: {e}")
                         continue
@@ -2728,15 +4137,32 @@ class PDFExtractor:
                                 image.close()
                             except:
                                 pass
+        except KeyboardInterrupt:
+            logging.info("Tesseract OCR process interrupted by user")
+            # Just let it propagate
+            raise
         except Exception as e:
             logging.error(f"Tesseract OCR extraction failed: {e}")
             return ""
         finally:
+            # Restore original signal handlers if we're in the main thread
+            if in_main_thread and original_sigint_handler and original_sigterm_handler:
+                signal.signal(signal.SIGINT, original_sigint_handler)
+                signal.signal(signal.SIGTERM, original_sigterm_handler)
+            
             # Clean up resources
             if images:
                 for img in images:
                     try:
                         img.close()
+                    except:
+                        pass
+            
+            # Terminate any remaining processes
+            for proc in processes:
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
                     except:
                         pass
         
@@ -2905,8 +4331,8 @@ class DocumentProcessor:
                         input_file,
                         output_dir,
                         method,
-                        ocr_method,  # Add this parameter in the correct position
-                        password,    # Move password to the correct position
+                        ocr_method,  # note: we must be very specific about the correct position
+                        password,    # because there are no named parameters for future executions!
                         extract_tables,
                         noskip,
                         sort,                     
@@ -3562,11 +4988,17 @@ class DocumentProcessor:
 
 # Signal handler to set the shutdown flag
 # Keep the global signal handler for setting the shutdown_flag
+# Keep track of any OCR subprocesses
+ocr_processes = []
+
 def signal_handler(signum, frame):
     """
-    Signal handler for SIGINT, SIGTERM, and other interrupt signals.
+    Enhanced signal handler for SIGINT, SIGTERM, and other interrupt signals.
     Sets the shutdown flag and logs the interrupt event.
+    Also attempts to terminate any running OCR processes.
     """
+    global ocr_processes
+    
     if not shutdown_flag.is_set():  # Only log once
         signal_name = {
             signal.SIGINT: "SIGINT (Ctrl+C)",
@@ -3575,6 +5007,41 @@ def signal_handler(signum, frame):
         }.get(signum, f"Signal {signum}")
         
         logging.info(f"Received {signal_name}. Initiating graceful shutdown...")
+        
+        # Try to terminate any active OCR processes
+        for proc in ocr_processes:
+            if proc and proc.poll() is None:  # If process exists and is still running
+                try:
+                    proc.terminate()
+                    logging.info(f"Terminated OCR process {proc.pid}")
+                except Exception as e:
+                    logging.error(f"Failed to terminate process: {e}")
+        
+        # Also try to find and kill tesseract processes based on name
+        if platform.system() != 'Windows':
+            try:
+                # Find all tesseract processes
+                procs = subprocess.run(
+                    ["pkill", "-f", "tesseract"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                logging.info("Attempted to terminate tesseract processes")
+            except Exception as e:
+                logging.debug(f"Could not kill tesseract processes: {e}")
+        else:
+            try:
+                # Windows version
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "tesseract.exe"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                logging.info("Attempted to terminate tesseract processes")
+            except Exception as e:
+                logging.debug(f"Could not kill tesseract processes: {e}")
+        
+        # Set the flag last
         shutdown_flag.set()
 
 # Register global handlers outside main()
@@ -3633,8 +5100,30 @@ def is_file_in_rename_script(rename_script_path, input_file):
     
 def sanitize_filename(name):
     """Sanitize a filename to ensure safe filesystem operations"""
+    unsafe_chars = {
+        '\\': '-',  # backslash to hyphen
+        '/': '-',   # forward slash to hyphen
+        ':': '-',   # colon to hyphen
+        '*': '',    # remove asterisk
+        '?': '',    # remove question mark
+        '"': '',    # remove double quote
+        "'": "",    # remove single quote
+        '<': '',    # remove less than
+        '>': '',    # remove greater than
+        '|': '-',   # pipe to hyphen
+        ';': '',    # remove semicolon
+        '`': '',    # remove backtick
+        '$': '',    # remove dollar sign
+        '&': 'and', # ampersand to 'and'
+        '!': '',    # remove exclamation
+        '#': '',    # remove hash
+    }
+    
+    for char, replacement in unsafe_chars.items():
+        name = name.replace(char, replacement)
+    
     # Remove disallowed characters
-    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    # name = re.sub(r'[\\/*?:"<>|]', "", name)
     
     # Handle spacing and initials
     if " " in name:
@@ -4247,70 +5736,6 @@ def extract_year_from_filename(filename):
     
     return None
 
-def sort_author_names_old(author_names, openai_client, max_attempts=5, verbose=False):
-    """Format author names into 'Lastname Firstname' format using LLM with backoff"""
-    base_retry_wait = 2  # Base wait time in seconds
-    for attempt in range(1, max_attempts + 1):
-        logging.debug(f"Attempt {attempt} to sort author names: {author_names}")
-        
-        formatted_author_names = author_names.replace('&', ',')
-        prompt = (
-            f"You will be given an author name that you must put into the format 'Lastname Surname'. "
-            f"So, you must first make an educated guess if the given input is already in this format. If so, return it back. "
-            f"If not and it is more plausibly in the format 'Surname(s) Lastname', you must reformat it. "
-            f"Example: 'Michael Max Mustermann' must become 'Mustermann Michael Max' and 'Joe A. Doe' must become 'Doe Joe A'. "
-            f"No comma after the Lastname! "
-            f"If you are given multiple person names, only keep the first and omit all others. "
-            f"If it is impossible to come up with a correct name, return <AUTHOR>n a</AUTHOR>. "
-            f"You must give the output in the format: <AUTHOR>Lastname Surname(s)</AUTHOR>. "
-            f"Here are the name parts: <AUTHOR>{formatted_author_names}</AUTHOR>"
-        )
-        messages = [{"role": "user", "content": prompt}]
-        
-        # Use the semaphore to limit concurrent requests
-        with ollama_semaphore:
-            try:
-                response = openai_client.chat.completions.create(
-                    model=MODEL_NAME,
-                    temperature=0.5,
-                    max_tokens=250,  # Reduced from 500 to save tokens
-                    messages=messages
-                )
-                
-                reformatted_name = response.choices[0].message.content.strip()
-                name_match = re.search(r'<AUTHOR>(.*?)</AUTHOR>', reformatted_name)
-                if name_match:
-                    ordered_name = name_match.group(1).strip().split(",")[0].strip()
-                    ordered_name = clean_author_name(ordered_name)
-                    logging.debug(f"Ordered name after cleaning: '{ordered_name}'")
-                    if valid_author_name(ordered_name):
-                        return ordered_name
-                    else:
-                        logging.warning(f"Invalid author name format detected: '{ordered_name}', retrying...")
-                else:
-                    logging.warning("Failed to extract a valid name, retrying...")
-                
-            except Exception as e:
-                if "rate_limit" in str(e).lower() or "timeout" in str(e).lower():
-                    wait_time = base_retry_wait * (2 ** (attempt - 1))
-                    logging.info(f"Rate limit or timeout encountered. Retrying in {wait_time:.2f} seconds...")
-                else:
-                    logging.error(f"Error querying Ollama server for author names: {e}")
-                    wait_time = base_retry_wait * (1.5 ** (attempt - 1))
-                    logging.info(f"Retrying in {wait_time:.2f} seconds...")
-                
-                if attempt < max_attempts:
-                    time.sleep(wait_time)
-                    continue
-                return "UnknownAuthor"
-        
-        # Wait a little between attempts even if no error occurred
-        if attempt < max_attempts:
-            time.sleep(1)  # Small pause between attempts
-                
-    logging.error("Maximum retry attempts reached for sorting author names.")
-    return "UnknownAuthor"
-
 def add_rename_command(rename_script_path, source_path, target_dir, new_filename, output_dir=None):
     """
     Add mkdir and mv commands to the rename script.
@@ -4324,8 +5749,9 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
         new_filename: New filename
         output_dir: Optional output directory for text files
     """
-    # Remove any commas from target directory name
-    target_dir = target_dir.replace(',', '')
+    # Sanitize both the target directory and filename
+    target_dir = sanitize_filename(target_dir.replace(',', '')) # remove also commas
+    new_filename = sanitize_filename(new_filename)
     
     # Determine if we're on Windows
     is_windows = platform.system() == 'Windows'
@@ -4544,15 +5970,24 @@ def _fallback_detect_language(text):
     return None
 
 def escape_special_chars(filename):
-    """
-    Safely escape special characters in filenames for shell commands.
-    """
+    """Safely escape special characters in filenames for shell commands."""
     try:
         import shlex
         return shlex.quote(filename)
     except ImportError:
-        logging.warning("shlex module not available. Falling back to regex-based escaping.")
-        return re.sub(r'([$`"\\])', r'\\\1', filename)
+        # Fallback handling if shlex is not available
+        sanitized = sanitize_filename(filename)
+        
+        # Escape remaining shell metacharacters
+        chars_to_escape = r'!$"`\\'
+        for char in chars_to_escape:
+            sanitized = sanitized.replace(char, '\\' + char)
+            
+        # Properly handle single quotes
+        if "'" in sanitized:
+            sanitized = sanitized.replace("'", "'\\''")
+            
+        return f"'{sanitized}'"
     
 def get_openai_client():
     """Initialize or return thread-local OpenAI client for Ollama"""
@@ -4644,7 +6079,7 @@ def main():
 
     parser.add_argument(
         '--ocr-method',
-        choices=['auto', 'tesseract', 'doctr', 'easyocr', 'kraken'],
+        choices=['auto', 'tesseract', 'paddleocr', 'doctr', 'easyocr', 'kraken', 'kraken_cli'],
         default='auto',
         help="Preferred OCR method when text extraction is needed"
     )
@@ -4820,7 +6255,7 @@ def main():
                 extract_tables=args.tables,
                 max_workers=args.workers,
                 noskip=args.noskip,
-                sort=args.sort,                     # sorting parameter
+                sort=args.sort,                         # sorting parameter
                 rename_script_path=rename_script_path,  # sorting parameter
                 llm_provider=llm_provider,
                 temperature=args.temperature,     

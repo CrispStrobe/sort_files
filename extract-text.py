@@ -791,6 +791,23 @@ class ImportCache:
 class ExtractionManager:
     """Central manager for text extraction operations"""
     
+    # Define supported file extensions
+    SUPPORTED_EXTENSIONS = {
+        '.pdf': 'PDF',
+        '.epub': 'EPUB',
+        '.djvu': 'DJVU',
+        '.djv': 'DJVU',
+        '.mobi': 'MOBI',
+        '.azw': 'MOBI',
+        '.azw3': 'MOBI',
+        '.txt': 'Text',
+        '.text': 'Text',
+        '.md': 'Text',
+        '.html': 'HTML',
+        '.htm': 'HTML',
+        '.xhtml': 'HTML'
+    }
+
     def __init__(self, debug: bool = False):
         self._debug = debug
         self._setup_logging(debug)
@@ -860,7 +877,8 @@ class ExtractionManager:
             'pytesseract', 'pdf2image', 'easyocr',
             'paddleocr', 'python-doctr', 'ocrmypdf', 'camelot-py',
             'ebooklib', 'beautifulsoup4', 'html2text', 'kraken',
-            'djvu', 'mobi', 'kindleunpack'
+            'djvu', 'mobi', 'kindleunpack',
+            'chardet', 'ftfy', 'lxml'
         ]
         
         for package in packages:
@@ -873,7 +891,7 @@ class ExtractionManager:
         
         return versions
 
-    def _get_extractor(self, file_path: str) -> Union['PDFExtractor', 'EPUBExtractor', 'DJVUExtractor', 'MOBIExtractor']:
+    def _get_extractor(self, file_path: str) -> Union['PDFExtractor', 'EPUBExtractor', 'DJVUExtractor', 'MOBIExtractor', 'TextExtractor', 'HTMLExtractor']:
         """Get or create appropriate extractor for file type"""
         file_ext = os.path.splitext(file_path)[1].lower()
         cache_key = f"{file_ext}:{file_path}"
@@ -881,16 +899,25 @@ class ExtractionManager:
         if cache_key not in self._extractors:
             import_cache = ImportCache()  # Create an import cache instance for all extractors
             
-            if file_ext == '.pdf':
+            # Get the extractor type from supported extensions
+            extractor_type = self.SUPPORTED_EXTENSIONS.get(file_ext)
+            
+            if not extractor_type:
+                raise ValueError(f"Unsupported file type: {file_path} (extension: {file_ext})")
+                
+            # Create appropriate extractor
+            if extractor_type == 'PDF':
                 self._extractors[cache_key] = PDFExtractor(debug=self._debug)
-            elif file_ext == '.epub':
+            elif extractor_type == 'EPUB':
                 self._extractors[cache_key] = EPUBExtractor(import_cache=import_cache, debug=self._debug)
-            elif file_ext in ['.djvu', '.djv']:
+            elif extractor_type == 'DJVU':
                 self._extractors[cache_key] = DJVUExtractor(import_cache=import_cache, debug=self._debug)
-            elif file_ext in ['.mobi', '.azw', '.azw3']:
+            elif extractor_type == 'MOBI':
                 self._extractors[cache_key] = MOBIExtractor(import_cache=import_cache, debug=self._debug)
-            else:
-                raise ValueError(f"Unsupported file type: {file_path}")
+            elif extractor_type == 'Text':
+                self._extractors[cache_key] = TextExtractor(import_cache=import_cache, debug=self._debug)
+            elif extractor_type == 'HTML':
+                self._extractors[cache_key] = HTMLExtractor(import_cache=import_cache, debug=self._debug)
         
         return self._extractors[cache_key]
     
@@ -923,11 +950,16 @@ class ExtractionManager:
             Extracted text if output_path is None, else success boolean
         """
         try:
+            # Check if file type is supported
+            file_ext = os.path.splitext(input_path)[1].lower()
+            if file_ext not in self.SUPPORTED_EXTENSIONS:
+                raise ValueError(f"Unsupported file type: {input_path} (extension: {file_ext})")
+                
             # Get appropriate extractor
             extractor = self._get_extractor(input_path)
             
             # Configure extraction
-            if password:
+            if password and hasattr(extractor, 'set_password'):
                 extractor.set_password(password)
             
             # Extract text with progress reporting
@@ -989,7 +1021,10 @@ class ExtractionManager:
                                 # Create target paths
                                 first_author = sanitize_filename(corrected_author)
 
-                                target_dir = os.path.join(os.path.dirname(input_path), first_author)
+                                # Use the output directory as the base for author directories
+                                base_dir = os.path.dirname(output_path) if output_path else os.path.abspath('.')
+                                target_dir = os.path.join(base_dir, first_author)
+                                
                                 file_extension = os.path.splitext(input_path)[1].lower()
                                 new_filename = f"{year} {sanitize_filename(title)}{file_extension}"
                                 logging.debug(f"New filename will be: {new_filename}")
@@ -1189,7 +1224,7 @@ class DJVUExtractor:
         return all(self._import_cache.is_available(m) for m in ocr_methods)
 
     def extract_text(self, djvu_path: str, preferred_method: Optional[str] = None,
-                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+                progress_callback: Optional[Callable] = None, **kwargs) -> str:
         """
         Extract text from DJVU with fallback methods
         
@@ -1220,9 +1255,15 @@ class DJVUExtractor:
                         progress_callback(0, f"djvu_{method}")  # Signal start with method name
                     
                     extraction_func = getattr(self, f'extract_with_{method}')
+                    
+                    # Fix: Create a proper lambda that accepts both arguments
+                    wrapped_callback = None
+                    if progress_callback:
+                        wrapped_callback = lambda n, engine=None: progress_callback(n, f"djvu_{method}" if engine is None else engine)
+                    
                     text = extraction_func(
                         djvu_path,
-                        lambda n: progress_callback(n, f"djvu_{method}") if progress_callback else None
+                        wrapped_callback  # Use the wrapped callback
                     )
                     
                     if text and text.strip():
@@ -1259,16 +1300,16 @@ class DJVUExtractor:
                                 
                                 pbar.update(1)
                                 if progress_callback:
-                                    progress_callback(1)
+                                    progress_callback(1, None)
                             except Exception as e:
                                 logging.debug(f"Error extracting page {i+1}: {e}")
                                 if progress_callback:
-                                    progress_callback(1)
-                
-                return "\n\n".join(text_parts)
+                                    progress_callback(1, None)
+                    
+                    return "\n\n".join(text_parts)
             except Exception as e:
-                logging.debug(f"Python-djvulibre extraction failed: {e}")
-                # Fall back to command line
+                    logging.debug(f"Python-djvulibre extraction failed: {e}")
+                    # Fall back to command line
         
         # Use djvutxt command line tool
         try:
@@ -1321,19 +1362,17 @@ class DJVUExtractor:
                 raise RuntimeError(f"DJVU to PDF conversion failed: {process.stderr}")
             
             # Use PDFExtractor to extract text from the converted PDF
-            from importlib import import_module
+            pdf_extractor = PDFExtractor(debug=self._debug)
             
-            # We need to import PDFExtractor from the module
-            # But avoid circular imports, so we'll create it dynamically
-            text = ""
-            try:
-                pdf_extractor = PDFExtractor(debug=self._debug)
-                text = pdf_extractor.extract_text(
-                    pdf_path,
-                    progress_callback=progress_callback
-                )
-            except Exception as e:
-                logging.debug(f"PDF extraction after conversion failed: {e}")
+            # Create a wrapped callback to handle both parameters
+            wrapped_callback = None
+            if progress_callback:
+                wrapped_callback = lambda n, engine=None: progress_callback(n, engine)
+                
+            text = pdf_extractor.extract_text(
+                pdf_path,
+                progress_callback=wrapped_callback
+            )
             
             # Clean up temporary PDF
             try:
@@ -1388,12 +1427,12 @@ class DJVUExtractor:
                             
                             pbar.update(1)
                             if progress_callback:
-                                progress_callback(1)
+                                progress_callback(1, None)
                         except Exception as e:
                             logging.debug(f"OCR failed for image {image_file}: {e}")
                             pbar.update(1)
                             if progress_callback:
-                                progress_callback(1)
+                                progress_callback(1, None)
                 
                 return "\n\n".join(text_parts)
                 
@@ -1987,6 +2026,340 @@ class DJVUExtractor:
                 
         except Exception as e:
             logging.debug(f"DJVU OCR extraction failed: {e}")
+            return ""
+
+class TextExtractor:
+    """Plain text file extraction with encoding detection"""
+    
+    def __init__(self, import_cache: ImportCache, debug: bool = False):
+        self._import_cache = import_cache
+        self._debug = debug
+        self._available_methods = None
+
+    @property
+    def available_methods(self) -> Dict[str, bool]:
+        """Lazy load available methods"""
+        if self._available_methods is None:
+            self._available_methods = {
+                'direct': True,  # Direct file reading is always available
+                'charset_detection': self._import_cache.is_available('chardet'),
+                'encoding_detection': self._import_cache.is_available('ftfy')
+            }
+        return self._available_methods
+
+    def extract_text(self, txt_path: str, preferred_method: Optional[str] = None,
+                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+        """
+        Extract text from plain text file with encoding detection
+        
+        Args:
+            txt_path: Path to text file
+            preferred_method: Optional preferred extraction method
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional options (ignored)
+            
+        Returns:
+            Extracted text
+        """
+        methods = ['charset_detection', 'encoding_detection', 'direct']
+        
+        # Reorder methods if preferred method is specified
+        if preferred_method and preferred_method in methods:
+            methods.insert(0, methods.pop(methods.index(preferred_method)))
+
+        text = ""
+        with tqdm(total=len(methods), desc="Trying text extraction methods", unit="method") as method_pbar:
+            for method in methods:
+                if not self.available_methods.get(method, False) and method != 'direct':
+                    method_pbar.update(1)
+                    continue
+                    
+                try:
+                    if progress_callback:
+                        progress_callback(0, f"text_{method}")  # Signal start with method name
+                    
+                    extraction_func = getattr(self, f'extract_with_{method}')
+                    text = extraction_func(
+                        txt_path,
+                        lambda n: progress_callback(n, f"text_{method}") if progress_callback else None
+                    )
+                    
+                    if text and text.strip():
+                        method_pbar.update(1)
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"Error with text {method}: {e}")
+                    
+                method_pbar.update(1)
+
+        return text.strip()
+
+    def extract_with_direct(self, txt_path: str, progress_callback=None) -> str:
+        """Extract text directly with UTF-8 encoding"""
+        try:
+            with open(txt_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+                
+            if progress_callback:
+                progress_callback(1)
+                
+            return text
+        except Exception as e:
+            logging.debug(f"Direct text extraction failed: {e}")
+            return ""
+
+    def extract_with_charset_detection(self, txt_path: str, progress_callback=None) -> str:
+        """Extract text with charset detection"""
+        try:
+            chardet = self._import_cache.import_module('chardet')
+            
+            # First read the file as binary
+            with open(txt_path, 'rb') as f:
+                raw_data = f.read()
+                
+            # Detect encoding
+            result = chardet.detect(raw_data)
+            encoding = result.get('encoding', 'utf-8')
+            confidence = result.get('confidence', 0)
+            
+            if confidence > 0.7:  # Only use if confidence is reasonable
+                logging.debug(f"Detected encoding {encoding} with confidence {confidence:.2f}")
+                # Decode using detected encoding
+                text = raw_data.decode(encoding, errors='replace')
+                
+                if progress_callback:
+                    progress_callback(1)
+                    
+                return text
+            else:
+                logging.debug(f"Low encoding confidence: {confidence:.2f} for {encoding}")
+                return ""
+                
+        except Exception as e:
+            logging.debug(f"Charset detection failed: {e}")
+            return ""
+
+    def extract_with_encoding_detection(self, txt_path: str, progress_callback=None) -> str:
+        """Extract text using ftfy for fixing encoding issues"""
+        try:
+            ftfy = self._import_cache.import_module('ftfy')
+            
+            # First try direct reading
+            with open(txt_path, 'r', encoding='utf-8', errors='replace') as f:
+                raw_text = f.read()
+                
+            # Fix text encoding
+            fixed_text = ftfy.fix_text(raw_text)
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return fixed_text
+            
+        except Exception as e:
+            logging.debug(f"Encoding detection failed: {e}")
+            return ""
+
+
+class HTMLExtractor:
+    """HTML file extraction with multiple fallback methods"""
+    
+    def __init__(self, import_cache: ImportCache, debug: bool = False):
+        self._import_cache = import_cache
+        self._debug = debug
+        self._available_methods = None
+
+    @property
+    def available_methods(self) -> Dict[str, bool]:
+        """Lazy load available methods"""
+        if self._available_methods is None:
+            self._available_methods = {
+                'bs4': self._import_cache.is_available('bs4'),
+                'html2text': self._import_cache.is_available('html2text'),
+                'lxml': self._import_cache.is_available('lxml'),
+                'regex': True  # Basic regex is always available
+            }
+        return self._available_methods
+
+    def extract_text(self, html_path: str, preferred_method: Optional[str] = None,
+                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+        """
+        Extract text from HTML file with multiple fallback methods
+        
+        Args:
+            html_path: Path to HTML file
+            preferred_method: Optional preferred extraction method
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional options (ignored)
+            
+        Returns:
+            Extracted text
+        """
+        methods = ['bs4', 'html2text', 'lxml', 'regex']
+        
+        # Reorder methods if preferred method is specified
+        if preferred_method and preferred_method in methods:
+            methods.insert(0, methods.pop(methods.index(preferred_method)))
+
+        text = ""
+        with tqdm(total=len(methods), desc="Trying HTML extraction methods", unit="method") as method_pbar:
+            for method in methods:
+                if not self.available_methods.get(method, False) and method != 'regex':
+                    method_pbar.update(1)
+                    continue
+                    
+                try:
+                    if progress_callback:
+                        progress_callback(0, f"html_{method}")  # Signal start with method name
+                    
+                    extraction_func = getattr(self, f'extract_with_{method}')
+                    text = extraction_func(
+                        html_path,
+                        lambda n: progress_callback(n, f"html_{method}") if progress_callback else None
+                    )
+                    
+                    if text and text.strip():
+                        method_pbar.update(1)
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"Error with HTML {method}: {e}")
+                    
+                method_pbar.update(1)
+
+        return text.strip()
+
+    def extract_with_bs4(self, html_path: str, progress_callback=None) -> str:
+        """Extract text using BeautifulSoup"""
+        try:
+            BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
+            
+            # First read the file
+            with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
+                html_content = f.read()
+                
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style", "meta", "noscript", "header", "footer", "nav"]):
+                script.extract()
+            
+            # Get text
+            text = soup.get_text()
+            
+            # Clean up text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"BeautifulSoup extraction failed: {e}")
+            return ""
+
+    def extract_with_html2text(self, html_path: str, progress_callback=None) -> str:
+        """Extract text using html2text"""
+        try:
+            html2text = self._import_cache.import_module('html2text').HTML2Text()
+            
+            # Configure html2text
+            html2text.ignore_links = True
+            html2text.ignore_images = True
+            html2text.ignore_tables = False
+            html2text.body_width = 0  # No wrapping
+            
+            # Read the file
+            with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
+                html_content = f.read()
+                
+            # Convert to markdown
+            text = html2text.handle(html_content)
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"html2text extraction failed: {e}")
+            return ""
+
+    def extract_with_lxml(self, html_path: str, progress_callback=None) -> str:
+        """Extract text using lxml"""
+        try:
+            lxml_html = self._import_cache.import_module('lxml.html')
+            
+            # Parse HTML file
+            with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
+                html_content = f.read()
+                
+            # Parse with lxml
+            root = lxml_html.fromstring(html_content)
+            
+            # Remove script and style elements
+            for elem in root.xpath('//script | //style | //meta | //noscript | //header | //footer | //nav'):
+                elem.getparent().remove(elem)
+            
+            # Extract text
+            text = ' '.join(root.xpath('//text()'))
+            
+            # Clean up text
+            import re
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"lxml extraction failed: {e}")
+            return ""
+
+    def extract_with_regex(self, html_path: str, progress_callback=None) -> str:
+        """Extract text using basic regex patterns"""
+        try:
+            import re
+            
+            # Read the file
+            with open(html_path, 'r', encoding='utf-8', errors='replace') as f:
+                html_content = f.read()
+                
+            # Remove script and style sections
+            html_content = re.sub(r'<script[^>]*>.*?</script>', ' ', html_content, flags=re.DOTALL)
+            html_content = re.sub(r'<style[^>]*>.*?</style>', ' ', html_content, flags=re.DOTALL)
+            
+            # Remove HTML tags
+            text = re.sub(r'<[^>]+>', ' ', html_content)
+            
+            # Clean up whitespace
+            text = re.sub(r'&nbsp;', ' ', text)
+            text = re.sub(r'&amp;', '&', text)
+            text = re.sub(r'&lt;', '<', text)
+            text = re.sub(r'&gt;', '>', text)
+            text = re.sub(r'&quot;', '"', text)
+            text = re.sub(r'&apos;', "'", text)
+            
+            # Normalize whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            # Split into paragraphs based on multiple newlines
+            paragraphs = re.split(r'\n\s*\n', text)
+            clean_paragraphs = [p.strip() for p in paragraphs if p.strip()]
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return '\n\n'.join(clean_paragraphs)
+            
+        except Exception as e:
+            logging.debug(f"Regex extraction failed: {e}")
             return ""
 
 class EPUBExtractor:
@@ -5284,18 +5657,23 @@ class DocumentProcessor:
     
     def _get_unique_output_path(self, input_file: str, output_dir: Optional[str] = None, noskip: bool = False) -> str:
         """
-        Generate output path for a given input file
+        Generate output path for a given input file without preserving subdirectory structure
         
         Args:
-            input_file: Path to input file
+            input_file: Path or filename of input file
             output_dir: Optional output directory
             noskip: Whether to generate unique filenames for existing files
             
         Returns:
             Output path (without creating unique name if noskip=False)
         """
-        # Convert input file to absolute path
-        input_path = Path(input_file).resolve()
+        # Extract just the basename from the input file, discarding any directory structure
+        input_basename = os.path.basename(input_file)
+        
+        # Convert input file to absolute path if it's a full path
+        if os.path.dirname(input_file):
+            input_path = Path(input_file).resolve()
+            input_basename = input_path.name
         
         # Use current directory if none specified, ensure it's a Path
         output_dir = Path(output_dir or '.').resolve()
@@ -5304,7 +5682,7 @@ class DocumentProcessor:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Get base name without extension
-        base_name = input_path.stem
+        base_name = Path(input_basename).stem
         
         # Create basic output path
         output_name = f"{base_name}.txt"
@@ -5329,16 +5707,6 @@ class DocumentProcessor:
     def _process_metadata_for_sorting(self, input_file, text, llm_provider, rename_script_path, output_path=None):
         """
         Extract and process metadata for sorting/renaming files.
-        
-        Args:
-            input_file: Path to the input file
-            text: Extracted text content
-            llm_provider: LLM provider instance or OpenAI client for Ollama
-            rename_script_path: Path to write rename commands
-            output_path: Path to the output text file
-            
-        Returns:
-            dict: Dictionary with result information
         """
         result = {
             'success': False,
@@ -5348,30 +5716,36 @@ class DocumentProcessor:
         }
         
         try:
-            logging.debug(f"Processing metadata for llm {llm_provider}.")
-
+            logging.debug(f"Processing metadata for file: {input_file}")
+            
             # Get metadata using the appropriate provider
             is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
             
             if is_openai_client:
                 # Using OpenAI client for Ollama
+                logging.debug(f"Using OpenAI client for Ollama to extract metadata")
                 metadata_content = send_to_ollama_server(text, input_file, llm_provider)
             else:
                 # Using an LLM provider instance
+                logging.debug(f"Using LLM provider instance to extract metadata")
                 metadata_content = send_to_llm(
                     text=text, 
                     filename=input_file, 
                     provider=llm_provider
                 )
-                
+            
+            logging.debug(f"Metadata content received: {metadata_content[:100]}...")
+            
             if not metadata_content:
                 result['error'] = "Failed to get metadata from LLM provider"
+                logging.warning(f"No metadata content received for {input_file}")
                 return result
-                
+            
             # Parse metadata with improved parser
-            metadata = parse_metadata(metadata_content)
+            metadata = parse_metadata(metadata_content, verbose=True)  # Enable verbose mode
             if not metadata:
                 result['error'] = "Failed to parse metadata"
+                logging.warning(f"Failed to parse metadata for {input_file}")
                 return result
                 
             # Get basic metadata fields
@@ -5390,18 +5764,14 @@ class DocumentProcessor:
                 
             # Process author with appropriate provider
             if is_openai_client:
-                corrected_author = corrected_author = sort_author_names(
+                corrected_author = sort_author_names(
                     author_names=author,
-                    provider=llm_provider,
-                    #temperature=temperature,
-                    #max_tokens=max_tokens
+                    provider=llm_provider
                 )
             else:
-                corrected_author = corrected_author = sort_author_names(
+                corrected_author = sort_author_names(
                     author_names=author,
-                    provider=llm_provider,
-                    #temperature=temperature,
-                    #max_tokens=max_tokens
+                    provider=llm_provider
                 )
                 
             if not corrected_author or corrected_author == "UnknownAuthor":
@@ -5417,8 +5787,17 @@ class DocumentProcessor:
             first_author = sanitize_filename(corrected_author)
             sanitized_title = sanitize_filename(title)
             
-            # Create target directory path
-            target_dir = os.path.join(os.path.dirname(input_file), first_author)
+            # Create target directory path using the base output directory, not preserving subdirectory structure
+            # Use the output_dir (if specified) or the current directory as the base
+            if output_path:
+                base_dir = os.path.dirname(output_path)
+                if not base_dir or base_dir == '.':
+                    base_dir = os.path.abspath('.')
+            else:
+                base_dir = os.path.abspath('.')
+                
+            # Create the target directory directly in the base directory
+            target_dir = os.path.join(base_dir, first_author)
             
             # Create new filename with year and title
             file_extension = os.path.splitext(input_file)[1].lower()
@@ -5429,7 +5808,7 @@ class DocumentProcessor:
                 # Extract just the base extension without dot
                 base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
                 # Replace the file extension with language code + extension
-                new_filename = f"{year} {sanitized_title}_{language}{base_ext}"
+                new_filename = f"{year} {sanitized_title}_{language}.{base_ext}"
             
             logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
             
@@ -5543,12 +5922,16 @@ class DocumentProcessor:
             input_file: Path to input file
             output_dir: Optional output directory
             method: Preferred extraction method
+            ocr_method: Optional OCR method
             password: Password for encrypted documents
             extract_tables: Whether to extract tables
             noskip: Whether to process even if output exists
             sort: Whether to sort files based on content
             rename_script_path: Path to write rename commands
             counters: Dictionary for tracking statistics
+            llm_provider: Provider for LLM communication
+            temperature: Temperature setting for LLM
+            max_tokens: Maximum tokens for LLM
             **kwargs: Additional extraction options
             
         Returns:
@@ -5582,9 +5965,16 @@ class DocumentProcessor:
             return result
         
         try:
-            # Generate basic output path (no uniqueness yet)
-            logging.debug(f"Processing for {llm_provider}.")
-            basic_output_path = self._get_unique_output_path(input_file, output_dir, noskip=False)
+            # Extract just the filename without path for output
+            input_basename = os.path.basename(input_file)
+            input_stem = os.path.splitext(input_basename)[0]  # Filename without extension
+            
+            # Use base output directory, creating it if needed
+            base_output_dir = os.path.abspath(output_dir or '.')
+            os.makedirs(base_output_dir, exist_ok=True)
+            
+            # Generate the output text file path
+            basic_output_path = os.path.join(base_output_dir, f"{input_stem}.txt")
             
             # Check if we should skip this file
             should_skip = False
@@ -5615,8 +6005,15 @@ class DocumentProcessor:
                 counters['skipped'] += 1
                 return result
             
-            # Get the actual output path (which might be unique if noskip=True)
-            output_path = self._get_unique_output_path(input_file, output_dir, noskip=noskip)
+            # Create unique output path if needed (for noskip option)
+            output_path = basic_output_path
+            if noskip and os.path.exists(basic_output_path):
+                counter = 1
+                while True:
+                    output_path = os.path.join(base_output_dir, f"{input_stem}_{counter}.txt")
+                    if not os.path.exists(output_path):
+                        break
+                    counter += 1
             
             # Determine if we need to extract text or can use existing file
             text = ""
@@ -5640,6 +6037,7 @@ class DocumentProcessor:
                     
                 text = self.manager.extract(
                     input_file,
+                    output_path=None,  # We'll handle saving ourselves
                     method=method,
                     ocr_method=ocr_method,
                     password=password,
@@ -5655,9 +6053,10 @@ class DocumentProcessor:
                 # Only save the text to file if we extracted it (not if we reused existing)
                 if not reused_text:
                     try:
-                        # Make sure the directory exists
-                        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+                        # Ensure the output directory exists
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
                         
+                        # Write the text file
                         with open(output_path, 'w', encoding='utf-8') as f:
                             f.write(text)
                         result['output_path'] = output_path
@@ -5665,7 +6064,7 @@ class DocumentProcessor:
                         if self._debug:
                             logging.info(f"Saved text to {output_path}")
                         else:
-                            logging.debug(f"Saved text to {output_path}")  # Log even in non-debug mode
+                            logging.debug(f"Saved text to {output_path}")
                             
                     except Exception as e:
                         logging.error(f"Failed to write output file {output_path}: {e}")
@@ -5677,13 +6076,17 @@ class DocumentProcessor:
                     result['output_path'] = basic_output_path
                 
                 # Handle sorting if enabled
-                try:
-                    # First, check what type of provider we have
-                    is_openai_client = False
-                    if llm_provider is None:
-                        # Fall back to local Ollama
-                        openai_client = get_openai_client()
-                        is_openai_client = True
+                if sort and llm_provider and rename_script_path:
+                    # Extract metadata from text
+                    metadata_content = None
+                    
+                    # Check what type of provider we have
+                    is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
+                    
+                    # Get metadata using the appropriate provider
+                    if llm_provider is None or is_openai_client:
+                        # Fall back to local Ollama with OpenAI client
+                        openai_client = llm_provider or get_openai_client()
                         metadata_content = send_to_ollama_server(text, input_file, openai_client)
                     else:
                         # Use the provided LLM provider
@@ -5695,18 +6098,18 @@ class DocumentProcessor:
                         )
                     
                     if metadata_content:
-                        # Parse metadata with improved parser
+                        # Parse metadata
                         metadata = parse_metadata(metadata_content)
                         if metadata:
                             # Process author names
                             author = metadata['author']
                             logging.debug(f"extracted author: {author}")
                             
-                            # Use appropriate method for author name sorting
+                            # Sort author names with appropriate provider
                             if is_openai_client:
                                 corrected_author = sort_author_names(author, openai_client)
                             else:
-                                corrected_author = corrected_author = sort_author_names(
+                                corrected_author = sort_author_names(
                                     author_names=author,
                                     provider=llm_provider,
                                     temperature=temperature,
@@ -5720,8 +6123,8 @@ class DocumentProcessor:
                             title = metadata['title']
                             year = metadata.get('year', 'Unknown')
                             
-                            # Validate and fix year with new helper function
-                            year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
+                            # Validate and fix year
+                            year = validate_and_fix_year(year, input_basename, text[:5000])
                             
                             # Get language if available
                             language = metadata.get('language', 'en')
@@ -5738,28 +6141,35 @@ class DocumentProcessor:
                                 # Create target paths with sanitized names
                                 first_author = sanitize_filename(corrected_author)
                                 sanitized_title = sanitize_filename(title)
-                                target_dir = os.path.join(os.path.dirname(input_file), first_author)
+                                
+                                # Create target directory in the base output directory
+                                target_dir = os.path.join(base_output_dir, first_author)
+                                
+                                # Get file extension and prepare new filename
                                 file_extension = os.path.splitext(input_file)[1].lower()
                                 
                                 # Create filename with appropriate formatting
                                 # Handle non-English files with language code
                                 if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
-                                    # Extract just the base extension without dot
+                                    # Extract base extension without dot
                                     base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
-                                    # Add language code before extension
+                                    # Add language code
                                     new_filename = f"{year} {sanitized_title}_{language}.{base_ext}"
                                 else:
-                                    new_filename = f"{year} {sanitized_title}.{file_extension}"
+                                    new_filename = f"{year} {sanitized_title}{file_extension}"
+                                
+                                # Fix any double dots in the filename
+                                new_filename = re.sub(r'\.{2,}', '.', new_filename)
                                 
                                 logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
                                 
-                                # Add rename command with improved function
+                                # Add rename command
                                 add_rename_command(
                                     rename_script_path,
                                     source_path=input_file,
                                     target_dir=target_dir,
                                     new_filename=new_filename,
-                                    output_dir=os.path.dirname(output_path) if output_path else None
+                                    output_dir=base_output_dir  # Use the base output directory for text files
                                 )
                                 
                                 result['metadata'] = metadata
@@ -5772,19 +6182,12 @@ class DocumentProcessor:
                                     unparseable_file.flush()
                             counters['sort_failed'] += 1
                     else:
-                        logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
+                        logging.warning(f"Failed to get metadata from LLM provider for {input_file}")
                         with file_lock:
                             with open("unparseables.lst", "a") as unparseable_file:
-                                unparseable_file.write(f"{input_file} - Failed to get metadata from Ollama server\n")
+                                unparseable_file.write(f"{input_file} - Failed to get metadata from LLM provider\n")
                                 unparseable_file.flush()
                         counters['sort_failed'] += 1
-                except Exception as sort_e:
-                    logging.error(f"Error sorting file {input_file}: {sort_e}")
-                    with file_lock:
-                        with open("unparseables.lst", "a") as unparseable_file:
-                            unparseable_file.write(f"{input_file} - Error during sorting: {str(sort_e)}\n")
-                            unparseable_file.flush()
-                    counters['sort_failed'] += 1
                 
                 # Extract tables if requested (only for PDFs)
                 if extract_tables and input_file.lower().endswith('.pdf'):
@@ -5798,7 +6201,9 @@ class DocumentProcessor:
                         result['tables'] = []
                 
                 # Extract file metadata
-                result['metadata'].update(self._extract_metadata(input_file))
+                file_metadata = self._extract_metadata(input_file)
+                if file_metadata:
+                    result['metadata'].update(file_metadata)
                     
             else:
                 logging.error(f"Failed to extract text from {input_file}")
@@ -6943,8 +7348,12 @@ def get_openai_client():
             # Import within the function to ensure it's available
             from openai import OpenAI
             
+            # Check if Ollama is accessible
+            ollama_url = "http://localhost:11434/v1/"
+            logging.debug(f"Initializing OpenAI client with base URL: {ollama_url}")
+            
             thread_local.client = OpenAI(
-                base_url="http://localhost:11434/v1/",
+                base_url=ollama_url,
                 api_key="ollama"
             )
             logging.debug("OpenAI client initialized successfully for thread.")
@@ -6962,7 +7371,7 @@ def main():
     
     """Command-line interface entry point"""
     parser = argparse.ArgumentParser(
-        description="Document Text Extraction Tool for PDF, EPUB, DJVU, and MOBI",
+        description="Document Text Extraction Tool for PDF, EPUB, DJVU, MOBI, TXT, HTML",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
@@ -6970,22 +7379,22 @@ def main():
               %(prog)s -o output_dir/ *.pdf
               %(prog)s --method=djvulibre input.djvu
               %(prog)s --method=mobi input.mobi
-              %(prog)s -m pymupdf -p password input.pdf
+              %(prog)s --method=bs4 input.html
+              %(prog)s "*.pdf *.djvu *.epub"  # Process multiple file types
               %(prog)s -t -j output.json *.pdf
               %(prog)s --noskip input.pdf  # Process even if output exists
               %(prog)s --sort *.pdf  # Sort and rename files based on content
               %(prog)s --sort --execute-rename *.pdf  # Sort and immediately execute rename commands
         """)
     )
-
-    # Add sort argument to the argparse parser in main()
+    
     parser.add_argument(
         '--sort',
         action='store_true',
-        help="Sort and rename files based on content analysis with Ollama"
+        help="Sort and rename files based on content analysis from LLM"
     )
 
-    # Add related arguments for renaming control
+    # arguments for renaming control
     parser.add_argument(
         '--execute-rename',
         action='store_true',
@@ -7000,8 +7409,8 @@ def main():
     
     parser.add_argument(
         'files',
-        nargs='+',
-        help="Input files to process (supports wildcards)"
+        nargs='*', # changed from +
+        help="Input files to process (supports wildcards and multiple file type patterns)"
     )
     
     parser.add_argument(
@@ -7012,7 +7421,10 @@ def main():
     
     parser.add_argument(
         '-m', '--method',
-        help="Preferred extraction method (pymupdf, pdfplumber, pypdf, pdfminer for PDF; ebooklib, bs4, zipfile for EPUB; djvulibre, pdf_conversion, ocr for DJVU; mobi, kindleunpack, calibre, zipfile for MOBI)"
+        help=("Preferred extraction method. PDF: pymupdf, pdfplumber, pypdf, pdfminer; "
+              "EPUB: ebooklib, bs4, zipfile; DJVU: djvulibre, pdf_conversion, ocr; "
+              "MOBI: mobi, kindleunpack, calibre, zipfile; TXT: direct, charset_detection, encoding_detection; "
+              "HTML: bs4, html2text, lxml, regex")
     )
 
     parser.add_argument(
@@ -7094,6 +7506,12 @@ def main():
         help="Maximum tokens in LLM response"
     )
 
+    # Add filter for specific file types
+    parser.add_argument(
+        '--file-types',
+        help="Only process specified file types (comma-separated, e.g., 'pdf,epub,djvu')"
+    )
+
     args = parser.parse_args()
     
     # Configure logging
@@ -7103,52 +7521,148 @@ def main():
     )
     
     try:
+        # Build list of supported extensions
+        supported_extensions = list(ExtractionManager.SUPPORTED_EXTENSIONS.keys())
+        
+        # Debug print to see what extensions are supported
+        logging.debug(f"Supported extensions: {supported_extensions}")
+        
+        # Filter extensions if file-types argument is provided
+        filtered_extensions = None
+        if args.file_types:
+            filtered_types = [f".{ext.strip().lower()}" for ext in args.file_types.split(',')]
+            filtered_extensions = [ext for ext in filtered_types if ext in supported_extensions]
+            if not filtered_extensions:
+                logging.error(f"No valid file types specified in: {args.file_types}")
+                logging.info(f"Supported file types: {', '.join(ext.lstrip('.') for ext in supported_extensions)}")
+                return 1
+        
         # Expand file patterns
         input_files = []
-        if args.recursive:
-            for pattern in args.files:
-                # If the pattern is an existing directory, walk it recursively
-                if os.path.isdir(pattern):
-                    # Directory walking code unchanged
-                    ...
-                # Check if the pattern is an existing file (handles spaces in filenames)
-                elif os.path.isfile(pattern):
-                    input_files.append(pattern)
-                else:
-                    # Pattern globbing for wildcards
-                    matched_files = glob.glob(pattern, recursive=True)
-                    if matched_files:
-                        input_files.extend(matched_files)
-                    else:
-                        logging.warning(f"No files found matching pattern: {pattern}")
+        
+        # Handle case when no files provided - process all supported types in current directory
+        if not args.files:
+            logging.info("No files specified, processing all supported file types in current directory")
+            for ext in filtered_extensions or supported_extensions:
+                pattern = f"*{ext}"
+                matched = glob.glob(pattern)
+                if matched:
+                    input_files.extend(matched)
+            
+            if not input_files:
+                logging.error("No supported files found in current directory")
+                return 1
         else:
-            for pattern in args.files:
-                # Check if the pattern is an existing file (handles spaces in filenames)
-                if os.path.isfile(pattern):
-                    input_files.append(pattern)
-                else:
-                    matched_files = glob.glob(pattern)
-                    if matched_files:
-                        input_files.extend(matched_files)
+            # Process each pattern which might include multiple space-separated patterns
+            for pattern_group in args.files:
+                # Debug which pattern we're processing
+                logging.debug(f"Processing pattern group: {pattern_group}")
+                
+                # Handle the case where the shell has already expanded the glob pattern
+                if os.path.isfile(pattern_group):
+                    file_ext = os.path.splitext(pattern_group)[1].lower()
+                    if file_ext in supported_extensions:
+                        input_files.append(pattern_group)
+                        if args.debug:
+                            logging.debug(f"Direct file match: {pattern_group}")
+                    continue
+                
+                # Split by space to handle multiple patterns like "*.pdf *.epub"
+                for pattern in pattern_group.split():
+                    if args.debug:
+                        logging.debug(f"Processing pattern: {pattern}")
+                    
+                    # Use case-insensitive pattern matching for extensions
+                    if '*.' in pattern:
+                        base_pattern = pattern.split('*.')[0]
+                        ext = pattern.split('*.')[1].lower()
+                        
+                        # Create case-insensitive patterns for common extension variants
+                        variants = [ext, ext.upper(), ext.capitalize()]
+                        for variant in variants:
+                            case_pattern = f"{base_pattern}*.{variant}"
+                            if args.debug:
+                                logging.debug(f"Trying case variant: {case_pattern}")
+                            matched = glob.glob(case_pattern)
+                            for matched_file in matched:
+                                if os.path.isfile(matched_file):
+                                    file_ext = os.path.splitext(matched_file)[1].lower()
+                                    if file_ext in supported_extensions:
+                                        input_files.append(matched_file)
+                                        if args.debug:
+                                            logging.debug(f"Matched file: {matched_file}")
+                            
+                    if args.recursive:
+                        # If the pattern is an existing directory, walk it recursively
+                        if os.path.isdir(pattern):
+                            for root, _, files in os.walk(pattern):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    file_ext = os.path.splitext(file_path)[1].lower()
+                                    # Only add supported file types
+                                    if filtered_extensions is None and file_ext in supported_extensions:
+                                        input_files.append(file_path)
+                                    elif filtered_extensions is not None and file_ext in filtered_extensions:
+                                        input_files.append(file_path)
+                        # Check if the pattern is an existing file (handles spaces in filenames)
+                        elif os.path.isfile(pattern):
+                            file_ext = os.path.splitext(pattern)[1].lower()
+                            if filtered_extensions is None and file_ext in supported_extensions:
+                                input_files.append(pattern)
+                            elif filtered_extensions is not None and file_ext in filtered_extensions:
+                                input_files.append(pattern)
+                        else:
+                            # Pattern globbing for wildcards with recursive option
+                            matched_files = glob.glob(pattern, recursive=True)
+                            for matched_file in matched_files:
+                                if os.path.isfile(matched_file):
+                                    file_ext = os.path.splitext(matched_file)[1].lower()
+                                    if filtered_extensions is None and file_ext in supported_extensions:
+                                        input_files.append(matched_file)
+                                    elif filtered_extensions is not None and file_ext in filtered_extensions:
+                                        input_files.append(matched_file)
                     else:
-                        logging.warning(f"No files found matching pattern: {pattern}")
+                        # Non-recursive mode
+                        # Check if the pattern is an existing file (handles spaces in filenames)
+                        if os.path.isfile(pattern):
+                            file_ext = os.path.splitext(pattern)[1].lower()
+                            if filtered_extensions is None and file_ext in supported_extensions:
+                                input_files.append(pattern)
+                            elif filtered_extensions is not None and file_ext in filtered_extensions:
+                                input_files.append(pattern)
+                        else:
+                            matched_files = glob.glob(pattern)
+                            for matched_file in matched_files:
+                                if os.path.isfile(matched_file):
+                                    file_ext = os.path.splitext(matched_file)[1].lower()
+                                    if filtered_extensions is None and file_ext in supported_extensions:
+                                        input_files.append(matched_file)
+                                    elif filtered_extensions is not None and file_ext in filtered_extensions:
+                                        input_files.append(matched_file)
+        
+        # Remove duplicates while preserving order
+        input_files = list(dict.fromkeys(input_files))
+        
+        if args.debug:
+            logging.debug(f"Files found after filtering: {len(input_files)}")
+            for file in input_files:
+                logging.debug(f"  {file}")
         
         if not input_files:
-            logging.error("No input files found")
+            logging.error("No supported input files found")
             return 1
             
         # Initialize processor
         processor = DocumentProcessor(debug=args.debug)
         
-        # Initialize Ollama client and rename script if sorting is enabled
-        openai_client = None
+        # Initialize LLM provider and rename script if sorting is enabled
         llm_provider = None
         rename_script_path = None
         
         if args.sort:
             try:
                 if args.llm_provider == "ollama":
-                    # For Ollama, we keep the existing behavior
+                    # For Ollama, we use the OpenAI client 
                     try:
                         from openai import OpenAI
                         OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
@@ -7162,7 +7676,7 @@ def main():
                         logging.error("Proceeding without sorting functionality")
                         args.sort = False
                 else:
-                    # For other providers, use the new provider factory
+                    # For other providers, use the provider factory
                     try:
                         llm_provider = get_llm_provider(
                             provider_type=args.llm_provider,
@@ -7190,11 +7704,19 @@ def main():
                 rename_script_path = None
         
         try:
+            # Display summary of files to process
+            logging.info(f"Processing {len(input_files)} files")
+            
+            # Group files by extension for stats
+            extension_counts = {}
+            for file in input_files:
+                ext = os.path.splitext(file)[1].lower()
+                extension_counts[ext] = extension_counts.get(ext, 0) + 1
+                
+            for ext, count in sorted(extension_counts.items()):
+                logging.info(f"  {ext} files: {count}")
+            
             # Process files with periodic shutdown checks
-            # Note: we don't set up signal handling here anymore - 
-            # it's done globally outside this function
-
-            # Pass sort-related parameters to process_files
             results = processor.process_files(
                 input_files,
                 output_dir=args.output_dir,
@@ -7204,11 +7726,11 @@ def main():
                 extract_tables=args.tables,
                 max_workers=args.workers,
                 noskip=args.noskip,
-                sort=args.sort,                         # sorting parameter
-                rename_script_path=rename_script_path,  # sorting parameter
+                sort=args.sort,
+                rename_script_path=rename_script_path,
                 llm_provider=llm_provider,
-                temperature=args.temperature,     
-                max_tokens=args.max_tokens,        
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
             )
             
             # Handle results
@@ -7233,7 +7755,7 @@ def main():
                     else:
                         logging.error(f"Batch script {batch_script_path} not found")
                 else:
-                    # Unix execution (unchanged)
+                    # Unix execution
                     logging.info("Executing rename commands...")
                     execute_rename_commands(rename_script_path)
             elif args.sort:
@@ -7251,8 +7773,7 @@ def main():
             successful = len(results.get('results', {})) - len(results.get('failed', []))
             skipped = len(results.get('skipped', []))
             
-            if args.debug:
-                logging.info(f"Summary: {successful} succeeded, {skipped} skipped, {len(results.get('failed', []))} failed")
+            logging.info(f"Summary: {successful} succeeded, {skipped} skipped, {len(results.get('failed', []))} failed")
             
             return 0 if not results.get('failed') else 1
             

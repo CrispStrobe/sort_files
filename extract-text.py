@@ -5556,6 +5556,7 @@ class DocumentProcessor:
             
             with tqdm(total=len(input_files), desc="Processing files", unit="file") as pbar:
                 for input_file in input_files:
+                    logging.debug(f"Processing {input_file}... with {llm_provider}")
                     if shutdown_flag.is_set():
                         logging.info("Shutdown flag detected. Not submitting more jobs.")
                         break
@@ -5937,6 +5938,8 @@ class DocumentProcessor:
         Returns:
             Dict with processing results
         """
+        logging.debug(f"Attempting processing of single file: {input_file} with {llm_provider}")
+        
         # Initialize result dictionary
         result = {
             'success': False,
@@ -5967,6 +5970,7 @@ class DocumentProcessor:
         try:
             # Extract just the filename without path for output
             input_basename = os.path.basename(input_file)
+            
             input_stem = os.path.splitext(input_basename)[0]  # Filename without extension
             
             # Use base output directory, creating it if needed
@@ -5996,6 +6000,7 @@ class DocumentProcessor:
                             logging.error(f"Error checking rename script: {e}")
                             # Continue processing if we can't check the rename script
             
+            
             if should_skip:
                 if self._debug:
                     logging.info(f"Skipping {input_file} - output file exists and already processed")
@@ -6007,10 +6012,12 @@ class DocumentProcessor:
             
             # Create unique output path if needed (for noskip option)
             output_path = basic_output_path
+            
             if noskip and os.path.exists(basic_output_path):
                 counter = 1
                 while True:
                     output_path = os.path.join(base_output_dir, f"{input_stem}_{counter}.txt")
+                    
                     if not os.path.exists(output_path):
                         break
                     counter += 1
@@ -6018,6 +6025,8 @@ class DocumentProcessor:
             # Determine if we need to extract text or can use existing file
             text = ""
             reused_text = False
+
+            
             
             if sort and os.path.exists(basic_output_path):
                 # Reuse existing text file for sorting
@@ -6032,8 +6041,7 @@ class DocumentProcessor:
                     
             # Extract text if we couldn't reuse existing
             if not reused_text:
-                if self._debug:
-                    logging.info(f"Processing {input_file} -> {output_path}")
+                logging.debug(f"Goint to extract {input_file} -> {output_path}")
                     
                 text = self.manager.extract(
                     input_file,
@@ -6044,6 +6052,8 @@ class DocumentProcessor:
                     extract_tables=extract_tables,
                     **kwargs
                 )
+
+            
             
             if text:
                 result['text'] = text
@@ -6075,18 +6085,16 @@ class DocumentProcessor:
                 else:
                     result['output_path'] = basic_output_path
                 
+                logging.debug(f"Working on {input_basename} => {output_path}: {sort}, {llm_provider}, {rename_script_path} ...")   
+                
                 # Handle sorting if enabled
-                if sort and llm_provider and rename_script_path:
-                    # Extract metadata from text
-                    metadata_content = None
-                    
-                    # Check what type of provider we have
-                    is_openai_client = hasattr(llm_provider, 'chat') and hasattr(llm_provider.chat, 'completions')
-                    
-                    # Get metadata using the appropriate provider
-                    if llm_provider is None or is_openai_client:
-                        # Fall back to local Ollama with OpenAI client
-                        openai_client = llm_provider or get_openai_client()
+                try:
+                    # First, check what type of provider we have
+                    is_openai_client = False
+                    if llm_provider is None:
+                        # Fall back to local Ollama
+                        openai_client = get_openai_client()
+                        is_openai_client = True
                         metadata_content = send_to_ollama_server(text, input_file, openai_client)
                     else:
                         # Use the provided LLM provider
@@ -6098,18 +6106,18 @@ class DocumentProcessor:
                         )
                     
                     if metadata_content:
-                        # Parse metadata
+                        # Parse metadata with improved parser
                         metadata = parse_metadata(metadata_content)
                         if metadata:
                             # Process author names
                             author = metadata['author']
                             logging.debug(f"extracted author: {author}")
                             
-                            # Sort author names with appropriate provider
+                            # Use appropriate method for author name sorting
                             if is_openai_client:
                                 corrected_author = sort_author_names(author, openai_client)
                             else:
-                                corrected_author = sort_author_names(
+                                corrected_author = corrected_author = sort_author_names(
                                     author_names=author,
                                     provider=llm_provider,
                                     temperature=temperature,
@@ -6123,8 +6131,8 @@ class DocumentProcessor:
                             title = metadata['title']
                             year = metadata.get('year', 'Unknown')
                             
-                            # Validate and fix year
-                            year = validate_and_fix_year(year, input_basename, text[:5000])
+                            # Validate and fix year with new helper function
+                            year = validate_and_fix_year(year, os.path.basename(input_file), text[:5000])
                             
                             # Get language if available
                             language = metadata.get('language', 'en')
@@ -6141,35 +6149,28 @@ class DocumentProcessor:
                                 # Create target paths with sanitized names
                                 first_author = sanitize_filename(corrected_author)
                                 sanitized_title = sanitize_filename(title)
-                                
-                                # Create target directory in the base output directory
-                                target_dir = os.path.join(base_output_dir, first_author)
-                                
-                                # Get file extension and prepare new filename
+                                target_dir = os.path.join(os.path.dirname(input_file), first_author)
                                 file_extension = os.path.splitext(input_file)[1].lower()
                                 
                                 # Create filename with appropriate formatting
                                 # Handle non-English files with language code
                                 if language and language.lower() not in ['en', 'eng', 'english', 'unknown']:
-                                    # Extract base extension without dot
+                                    # Extract just the base extension without dot
                                     base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
-                                    # Add language code
+                                    # Add language code before extension
                                     new_filename = f"{year} {sanitized_title}_{language}.{base_ext}"
                                 else:
-                                    new_filename = f"{year} {sanitized_title}{file_extension}"
-                                
-                                # Fix any double dots in the filename
-                                new_filename = re.sub(r'\.{2,}', '.', new_filename)
+                                    new_filename = f"{year} {sanitized_title}.{file_extension}"
                                 
                                 logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
                                 
-                                # Add rename command
+                                # Add rename command with improved function
                                 add_rename_command(
                                     rename_script_path,
                                     source_path=input_file,
                                     target_dir=target_dir,
                                     new_filename=new_filename,
-                                    output_dir=base_output_dir  # Use the base output directory for text files
+                                    output_dir=os.path.dirname(output_path) if output_path else None
                                 )
                                 
                                 result['metadata'] = metadata
@@ -6182,12 +6183,19 @@ class DocumentProcessor:
                                     unparseable_file.flush()
                             counters['sort_failed'] += 1
                     else:
-                        logging.warning(f"Failed to get metadata from LLM provider for {input_file}")
+                        logging.warning(f"Failed to get metadata from Ollama server for {input_file}")
                         with file_lock:
                             with open("unparseables.lst", "a") as unparseable_file:
-                                unparseable_file.write(f"{input_file} - Failed to get metadata from LLM provider\n")
+                                unparseable_file.write(f"{input_file} - Failed to get metadata from Ollama server\n")
                                 unparseable_file.flush()
                         counters['sort_failed'] += 1
+                except Exception as sort_e:
+                    logging.error(f"Error sorting file {input_file}: {sort_e}")
+                    with file_lock:
+                        with open("unparseables.lst", "a") as unparseable_file:
+                            unparseable_file.write(f"{input_file} - Error during sorting: {str(sort_e)}\n")
+                            unparseable_file.flush()
+                    counters['sort_failed'] += 1
                 
                 # Extract tables if requested (only for PDFs)
                 if extract_tables and input_file.lower().endswith('.pdf'):
@@ -6538,7 +6546,6 @@ def execute_rename_commands(script_path):
     except Exception as e:
         logging.error(f"Unexpected error during rename command execution: {e}")
 
-
 def parse_metadata(content, verbose=False):
     """
     Parse metadata content returned by the Ollama server supporting multiple formats.
@@ -6547,6 +6554,8 @@ def parse_metadata(content, verbose=False):
     Returns:
         dict or None: Dictionary containing author, year, title, and language
     """
+    logging.debug("parsing metadata...")
+    
     # Remove XML declarations which might interfere with parsing
     content = re.sub(r'<\?xml[^>]+\?>', '', content)
     
@@ -6663,6 +6672,7 @@ def send_to_ollama_server(text, filename, openai_client, max_attempts=5, verbose
     Returns:
         str: The formatted metadata response
     """
+    logging.debug("preparing sending to ollama...")
     base_retry_wait = 2  # Base wait time in seconds
     attempt = 1
     
@@ -7661,8 +7671,9 @@ def main():
         
         if args.sort:
             try:
+                logging.debug(f"checking for llm provider: {args.llm_provider}")
                 if args.llm_provider == "ollama":
-                    # For Ollama, we use the OpenAI client 
+                    # For Ollama, we keep the existing behavior
                     try:
                         from openai import OpenAI
                         OpenAI(base_url="http://localhost:11434/v1/", api_key="ollama")
@@ -7676,7 +7687,7 @@ def main():
                         logging.error("Proceeding without sorting functionality")
                         args.sort = False
                 else:
-                    # For other providers, use the provider factory
+                    # For other providers, use the new provider factory
                     try:
                         llm_provider = get_llm_provider(
                             provider_type=args.llm_provider,
@@ -7702,6 +7713,11 @@ def main():
                 args.sort = False
                 llm_provider = None
                 rename_script_path = None
+                
+        if args.sort:  # Check again in case we disabled it due to errors
+                # Initialize rename script
+                rename_script_path = args.rename_script
+                script_paths = initialize_rename_scripts(rename_script_path)
         
         try:
             # Display summary of files to process
@@ -7715,6 +7731,9 @@ def main():
                 
             for ext, count in sorted(extension_counts.items()):
                 logging.info(f"  {ext} files: {count}")
+
+            logging.debug(f"initiating process files for {llm_provider}")
+
             
             # Process files with periodic shutdown checks
             results = processor.process_files(

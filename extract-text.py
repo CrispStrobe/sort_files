@@ -4568,7 +4568,7 @@ class DocumentProcessor:
                 # Extract just the base extension without dot
                 base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
                 # Replace the file extension with language code + extension
-                new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
+                new_filename = f"{year} {sanitized_title}_{language}{base_ext}"
             
             logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
             
@@ -4886,9 +4886,9 @@ class DocumentProcessor:
                                     # Extract just the base extension without dot
                                     base_ext = file_extension[1:] if file_extension.startswith('.') else file_extension
                                     # Add language code before extension
-                                    new_filename = f"{year} {sanitized_title}.{language}.{base_ext}"
+                                    new_filename = f"{year} {sanitized_title}_{language}.{base_ext}"
                                 else:
-                                    new_filename = f"{year} {sanitized_title}{file_extension}"
+                                    new_filename = f"{year} {sanitized_title}.{file_extension}"
                                 
                                 logging.debug(f"New path/filename will be: {target_dir}/{new_filename}")
                                 
@@ -5117,6 +5117,8 @@ def sanitize_filename(name):
         '&': 'and', # ampersand to 'and'
         '!': '',    # remove exclamation
         '#': '',    # remove hash
+        '=': '',    # remove equals sign
+        #'.': '',    # remove periods
     }
     
     for char, replacement in unsafe_chars.items():
@@ -5499,7 +5501,7 @@ def initialize_rename_scripts(rename_script_path):
     if create_bash:
         with open(rename_script_path, "w") as bash_file:
             bash_file.write("#!/bin/bash\n")
-            bash_file.write('set -e\n\n')
+            #bash_file.write('set -e\n\n')
             bash_file.flush()
         
         try:
@@ -5736,7 +5738,7 @@ def extract_year_from_filename(filename):
     
     return None
 
-def add_rename_command(rename_script_path, source_path, target_dir, new_filename, output_dir=None):
+def add_rename_command(rename_script_path, source_path, target_dir, new_filename, output_dir=None, debug=False):
     """
     Add mkdir and mv commands to the rename script.
     Also moves the corresponding .txt file if it exists.
@@ -5748,10 +5750,64 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
         target_dir: Target directory path - will have any commas removed
         new_filename: New filename
         output_dir: Optional output directory for text files
+        debug: Whether to print verbose debug information
+    
+    Returns:
+        dict: Information about the generated scripts and paths
     """
+    import os
+    import re
+    import platform
+    import logging
+
     # Sanitize both the target directory and filename
-    target_dir = sanitize_filename(target_dir.replace(',', '')) # remove also commas
+    target_dir = sanitize_filename(target_dir.replace(',', ''))  # remove also commas
+    
+    # Sanitize the new filename user gave us (removing weird chars)
     new_filename = sanitize_filename(new_filename)
+
+    # Figure out the original extension
+    orig_ext = os.path.splitext(source_path)[1].lower()  # e.g. ".pdf" or ".epub"
+    if debug:
+        logging.debug(f"Original file extension: {orig_ext}")
+
+    # Create a clean version of the original extension without the dot
+    clean_ext = orig_ext.lstrip('.')
+    
+    # Handle cases where extension might be embedded in the filename
+    # Look for pattern where extension is at the end or followed by another extension
+    endings_to_fix = [
+        f"{clean_ext}",           # Handles "Titlepdf"
+        f"{clean_ext}{orig_ext}", # Handles "Titlepdf.pdf"
+        f"de{clean_ext}",         # Handles "Staatdepdf"
+        f"in{clean_ext}",         # Handles common patterns like "Bookinpdf"
+    ]
+    
+    for ending in endings_to_fix:
+        if new_filename.lower().endswith(ending.lower()):
+            # Replace the problematic ending
+            new_filename = new_filename[:-len(ending)]
+            if debug:
+                logging.debug(f"Removed ending '{ending}', now: {new_filename}")
+            break
+            
+    # Also check for the extension embedded elsewhere in the filename
+    # We need to be careful not to remove legitimate words that might contain these letters
+    # So we specifically look for extension patterns with word boundaries
+    ext_pattern = r'\b' + clean_ext + r'\b'
+    if re.search(ext_pattern, new_filename, re.IGNORECASE):
+        new_filename = re.sub(ext_pattern, '', new_filename, flags=re.IGNORECASE)
+        if debug:
+            logging.debug(f"Removed embedded extension, now: {new_filename}")
+    
+    # Clean up any extra spaces
+    new_filename = re.sub(r'\s+', ' ', new_filename).strip()
+    
+    # If the new name doesn't already end with the real extension, append it
+    if not new_filename.lower().endswith(orig_ext.lower()):
+        new_filename += orig_ext
+        if debug:
+            logging.debug(f"Added extension: {new_filename}")
     
     # Determine if we're on Windows
     is_windows = platform.system() == 'Windows'
@@ -5806,6 +5862,15 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
     win_txt_source_path = '"' + win_txt_source + '"'
     win_txt_target_path = '"' + win_txt_target + '"'
     
+    if debug:
+        logging.debug(f"Source path: {source_path}")
+        logging.debug(f"Target directory: {target_dir}")
+        logging.debug(f"New filename: {new_filename}")
+        logging.debug(f"Full target path: {os.path.join(target_dir, new_filename)}")
+        if txt_source_path:
+            logging.debug(f"Text source path: {txt_source_path}")
+            logging.debug(f"Text target path: {txt_target_path}")
+    
     # Write to the bash script if needed
     if create_bash:
         with file_lock:
@@ -5822,6 +5887,9 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
                 bash_file.write(f"  mv {escaped_txt_source_path} {escaped_txt_target_path}\n")
                 bash_file.write(f"fi\n\n")
                 bash_file.flush()
+                
+        if debug:
+            logging.debug(f"Added commands to bash script: {rename_script_path}")
     
     # Write to the Windows batch script if needed
     if create_batch:
@@ -5839,6 +5907,9 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
                 batch_file.write(f"  move {win_txt_source_path} {win_txt_target_path}\n")
                 batch_file.write(f")\n\n")
                 batch_file.flush()
+                
+        if debug:
+            logging.debug(f"Added commands to batch script: {batch_script_path}")
     
     logging.debug(f"Added rename command: {source_path} -> {os.path.join(target_dir, new_filename)}")
     if os.path.exists(txt_source_path):

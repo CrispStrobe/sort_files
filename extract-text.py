@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Cross-platform PDF and EPUB text extraction tool
+Cross-platform PDF, EPUB, DJVU, and MOBI text extraction tool
 
 Installation:
 1. Python packages (all platforms):
    pip install pymupdf pdfplumber pypdf pdfminer.six pytesseract pdf2image kraken easyocr paddleocr python-doctr ocrmypdf camelot-py opencv-python importlib-metadata tqdm
 
-   Additional EPUB dependencies:
-   pip install ebooklib beautifulsoup4 html2text mobi
+   Additional format dependencies:
+   pip install ebooklib beautifulsoup4 html2text mobi djvu kindleunpack 
 
 2. System dependencies:
    Windows:
    - Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
    - Ghostscript: https://ghostscript.com/releases/gsdnld.html
    - Poppler: https://github.com/oschwartz10612/poppler-windows/releases/
+   - DjVuLibre: https://sourceforge.net/projects/djvu/files/DjVuLibre_Windows/
+   - Calibre: https://calibre-ebook.com/download
 
    macOS:
-   brew install tesseract poppler ghostscript
+   brew install tesseract poppler ghostscript djvulibre calibre
 
    Linux:
-   sudo apt-get install tesseract-ocr poppler-utils ghostscript
+   sudo apt-get install tesseract-ocr poppler-utils ghostscript djvulibre-bin calibre
 """
 import warnings
 # Suppress common warnings
@@ -32,7 +34,7 @@ import re
 import sys
 import logging
 import argparse
-from typing import Optional, List, Dict, Any,  Union, Tuple, Callable
+from typing import Optional, List, Dict, Any, Union, Tuple, Callable
 import textwrap
 import pkg_resources
 import traceback
@@ -828,7 +830,10 @@ class ExtractionManager:
         binaries = {
             'tesseract': False,
             'pdftoppm': False,
-            'gs': False
+            'gs': False,
+            'djvutxt': False,  # For DJVU
+            'ddjvu': False,    # For DJVU conversion
+            'ebook-convert': False  # For Calibre/MOBI
         }
         
         for binary in binaries:
@@ -854,7 +859,8 @@ class ExtractionManager:
             'pymupdf', 'pdfplumber', 'pypdf', 'pdfminer.six',
             'pytesseract', 'pdf2image', 'easyocr',
             'paddleocr', 'python-doctr', 'ocrmypdf', 'camelot-py',
-            'ebooklib', 'beautifulsoup4', 'html2text', 'kraken'
+            'ebooklib', 'beautifulsoup4', 'html2text', 'kraken',
+            'djvu', 'mobi', 'kindleunpack'
         ]
         
         for package in packages:
@@ -867,18 +873,22 @@ class ExtractionManager:
         
         return versions
 
-    def _get_extractor(self, file_path: str) -> Union['PDFExtractor', 'EPUBExtractor']:
+    def _get_extractor(self, file_path: str) -> Union['PDFExtractor', 'EPUBExtractor', 'DJVUExtractor', 'MOBIExtractor']:
         """Get or create appropriate extractor for file type"""
         file_ext = os.path.splitext(file_path)[1].lower()
         cache_key = f"{file_ext}:{file_path}"
         
         if cache_key not in self._extractors:
+            import_cache = ImportCache()  # Create an import cache instance for all extractors
+            
             if file_ext == '.pdf':
                 self._extractors[cache_key] = PDFExtractor(debug=self._debug)
             elif file_ext == '.epub':
-                # Create and pass the ImportCache instance
-                import_cache = ImportCache()
                 self._extractors[cache_key] = EPUBExtractor(import_cache=import_cache, debug=self._debug)
+            elif file_ext in ['.djvu', '.djv']:
+                self._extractors[cache_key] = DJVUExtractor(import_cache=import_cache, debug=self._debug)
+            elif file_ext in ['.mobi', '.azw', '.azw3']:
+                self._extractors[cache_key] = MOBIExtractor(import_cache=import_cache, debug=self._debug)
             else:
                 raise ValueError(f"Unsupported file type: {file_path}")
         
@@ -901,10 +911,11 @@ class ExtractionManager:
             input_path: Path to input document
             output_path: Optional path for output text file
             method: Preferred extraction method
+            ocr_method: Optional OCR method (only passed to PDF extractors)
             password: Password for encrypted documents
             extract_tables: Whether to extract tables (PDF only)
             sort: Whether to sort files based on content
-            openai_client: OpenAI client for Ollama communication
+            llm_provider: Provider for LLM communication
             rename_script_path: Path to write rename commands
             **kwargs: Additional extraction options
             
@@ -926,15 +937,18 @@ class ExtractionManager:
                         pbar.set_description(f"Extracting text [{engine}]")
                     pbar.update(n)
                 
-                # Only pass extract_tables parameter to PDFExtractor
+                # Only pass specific parameters based on extractor type
                 extraction_kwargs = kwargs.copy()
-                if isinstance(extractor, PDFExtractor) and extract_tables:
-                    extraction_kwargs['extract_tables'] = extract_tables
+                if isinstance(extractor, PDFExtractor):
+                    # Only pass ocr_method to PDFExtractor
+                    if ocr_method:
+                        extraction_kwargs['ocr_method'] = ocr_method
+                    if extract_tables:
+                        extraction_kwargs['extract_tables'] = extract_tables
                 
                 text = extractor.extract_text(
                     input_path,
                     preferred_method=method,
-                    ocr_method=ocr_method,
                     progress_callback=progress_callback,
                     **extraction_kwargs
                 )
@@ -1127,6 +1141,853 @@ class ExtractionManager:
         except ImportError:
             logging.warning("PyTorch not available - using CPU only")
             return False
+
+class DJVUExtractor:
+    """DJVU text extraction with multiple fallback methods"""
+    
+    def __init__(self, import_cache: ImportCache, debug: bool = False):
+        self._import_cache = import_cache
+        self._debug = debug
+        self._available_methods = None
+
+    @property
+    def available_methods(self) -> Dict[str, bool]:
+        """Lazy load available methods"""
+        if self._available_methods is None:
+            self._available_methods = {
+                'djvulibre': self._check_djvulibre(),
+                'pdf_conversion': self._check_pdf_conversion(),
+                'ocr': self._check_ocr_dependencies(),
+            }
+        return self._available_methods
+
+    def _check_djvulibre(self) -> bool:
+        """Check if djvulibre tools are available"""
+        # First check if python-djvulibre is available
+        if self._import_cache.is_available('djvu'):
+            return True
+            
+        # Otherwise check for djvutxt command line tool
+        try:
+            import shutil
+            return shutil.which('djvutxt') is not None
+        except:
+            return False
+    
+    def _check_pdf_conversion(self) -> bool:
+        """Check if DJVU to PDF conversion is available"""
+        try:
+            import shutil
+            return shutil.which('ddjvu') is not None
+        except:
+            return False
+    
+    def _check_ocr_dependencies(self) -> bool:
+        """Check if OCR dependencies are available"""
+        # We'll reuse the existing OCR infrastructure for images
+        ocr_methods = ['tesseract', 'pdf2image', 'pytesseract']
+        return all(self._import_cache.is_available(m) for m in ocr_methods)
+
+    def extract_text(self, djvu_path: str, preferred_method: Optional[str] = None,
+                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+        """
+        Extract text from DJVU with fallback methods
+        
+        Args:
+            djvu_path: Path to DJVU file
+            preferred_method: Optional preferred extraction method
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional options (ignored)
+            
+        Returns:
+            Extracted text
+        """
+        methods = ['djvulibre', 'pdf_conversion', 'ocr']
+        
+        # Reorder methods if preferred method is specified
+        if preferred_method and preferred_method in methods:
+            methods.insert(0, methods.pop(methods.index(preferred_method)))
+
+        text = ""
+        with tqdm(total=len(methods), desc="Trying DJVU extraction methods", unit="method") as method_pbar:
+            for method in methods:
+                if not self.available_methods.get(method, False):
+                    method_pbar.update(1)
+                    continue
+                    
+                try:
+                    if progress_callback:
+                        progress_callback(0, f"djvu_{method}")  # Signal start with method name
+                    
+                    extraction_func = getattr(self, f'extract_with_{method}')
+                    text = extraction_func(
+                        djvu_path,
+                        lambda n: progress_callback(n, f"djvu_{method}") if progress_callback else None
+                    )
+                    
+                    if text and text.strip():
+                        method_pbar.update(1)
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"Error with DJVU {method}: {e}")
+                    
+                method_pbar.update(1)
+
+        return text.strip()
+
+    def extract_with_djvulibre(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text using djvulibre library or command-line tools"""
+        # Try python-djvulibre first if available
+        if self._import_cache.is_available('djvu'):
+            try:
+                djvu = self._import_cache.import_module('djvu')
+                
+                # Use the Python bindings for DjVuLibre
+                text_parts = []
+                
+                with djvu.DjVuDocument.create_by_filename(djvu_path) as doc:
+                    total_pages = doc.pages_number
+                    
+                    with tqdm(total=total_pages, desc="DjVuLibre extraction", unit="pages") as pbar:
+                        for i in range(total_pages):
+                            try:
+                                page = doc.pages[i]
+                                page_text = page.text.decode('utf-8', errors='replace')
+                                if page_text.strip():
+                                    text_parts.append(page_text.strip())
+                                
+                                pbar.update(1)
+                                if progress_callback:
+                                    progress_callback(1)
+                            except Exception as e:
+                                logging.debug(f"Error extracting page {i+1}: {e}")
+                                if progress_callback:
+                                    progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+            except Exception as e:
+                logging.debug(f"Python-djvulibre extraction failed: {e}")
+                # Fall back to command line
+        
+        # Use djvutxt command line tool
+        try:
+            import subprocess
+            import tempfile
+            
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                temp_path = temp.name
+            
+            # Run djvutxt to extract text
+            cmd = ['djvutxt', djvu_path, temp_path]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"djvutxt failed: {process.stderr}")
+            
+            # Read the output file
+            with open(temp_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+                
+            # Clean up temporary file
+            import os
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+                
+            return text
+                
+        except Exception as e:
+            logging.debug(f"DjVuLibre command-line extraction failed: {e}")
+            return ""
+
+    def extract_with_pdf_conversion(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text by converting to PDF first, then using PDF extraction"""
+        try:
+            import tempfile
+            import subprocess
+            import os
+            
+            # Create a temporary file for the PDF
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp:
+                pdf_path = temp.name
+            
+            # Convert DJVU to PDF
+            cmd = ['ddjvu', '-format=pdf', djvu_path, pdf_path]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"DJVU to PDF conversion failed: {process.stderr}")
+            
+            # Use PDFExtractor to extract text from the converted PDF
+            from importlib import import_module
+            
+            # We need to import PDFExtractor from the module
+            # But avoid circular imports, so we'll create it dynamically
+            text = ""
+            try:
+                pdf_extractor = PDFExtractor(debug=self._debug)
+                text = pdf_extractor.extract_text(
+                    pdf_path,
+                    progress_callback=progress_callback
+                )
+            except Exception as e:
+                logging.debug(f"PDF extraction after conversion failed: {e}")
+            
+            # Clean up temporary PDF
+            try:
+                os.unlink(pdf_path)
+            except:
+                pass
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"DJVU to PDF conversion failed: {e}")
+            return ""
+
+    def extract_with_ocr(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text using OCR by converting to images first"""
+        try:
+            # First convert DJVU to images
+            import tempfile
+            import subprocess
+            import os
+            import glob
+            
+            # Create a temporary directory for the images
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Convert DJVU to images
+                output_pattern = os.path.join(temp_dir, 'page_%d.tif')
+                cmd = ['ddjvu', '-format=tiff', djvu_path, output_pattern]
+                process = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if process.returncode != 0:
+                    raise RuntimeError(f"DJVU to images conversion failed: {process.stderr}")
+                
+                # Get list of generated images
+                image_files = sorted(glob.glob(os.path.join(temp_dir, 'page_*.tif')))
+                
+                if not image_files:
+                    raise RuntimeError("No images generated from DJVU")
+                
+                # Perform OCR on the images using tesseract
+                import pytesseract
+                from PIL import Image
+                
+                text_parts = []
+                with tqdm(total=len(image_files), desc="OCR processing", unit="page") as pbar:
+                    for image_file in image_files:
+                        try:
+                            img = Image.open(image_file)
+                            page_text = pytesseract.image_to_string(img, lang='eng')
+                            if page_text.strip():
+                                text_parts.append(page_text.strip())
+                            img.close()
+                            
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                        except Exception as e:
+                            logging.debug(f"OCR failed for image {image_file}: {e}")
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+                
+        except Exception as e:
+            logging.debug(f"DJVU OCR extraction failed: {e}")
+            return ""
+
+class MOBIExtractor:
+    """MOBI text extraction with multiple fallback methods"""
+    
+    def __init__(self, import_cache: ImportCache, debug: bool = False):
+        self._import_cache = import_cache
+        self._debug = debug
+        self._available_methods = None
+
+    @property
+    def available_methods(self) -> Dict[str, bool]:
+        """Lazy load available methods"""
+        if self._available_methods is None:
+            self._available_methods = {
+                'mobi': self._import_cache.is_available('mobi'),
+                'kindleunpack': self._import_cache.is_available('kindleunpack'),
+                'calibre': self._check_calibre(),
+                'zipfile': True  # Basic fallback always available
+            }
+        return self._available_methods
+
+    def _check_calibre(self) -> bool:
+        """Check if calibre command line tools are available"""
+        try:
+            import shutil
+            return shutil.which('ebook-convert') is not None
+        except:
+            return False
+
+    def extract_text(self, mobi_path: str, preferred_method: Optional[str] = None,
+                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+        """
+        Extract text from MOBI with fallback methods
+        
+        Args:
+            mobi_path: Path to MOBI file
+            preferred_method: Optional preferred extraction method
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional options (ignored)
+            
+        Returns:
+            Extracted text
+        """
+        methods = ['mobi', 'kindleunpack', 'calibre', 'zipfile']
+        
+        # Reorder methods if preferred method is specified
+        if preferred_method and preferred_method in methods:
+            methods.insert(0, methods.pop(methods.index(preferred_method)))
+
+        text = ""
+        with tqdm(total=len(methods), desc="Trying MOBI extraction methods", unit="method") as method_pbar:
+            for method in methods:
+                if not self.available_methods.get(method, False):
+                    method_pbar.update(1)
+                    continue
+                    
+                try:
+                    if progress_callback:
+                        progress_callback(0, f"mobi_{method}")  # Signal start with method name
+                    
+                    extraction_func = getattr(self, f'extract_with_{method}')
+                    text = extraction_func(
+                        mobi_path,
+                        lambda n: progress_callback(n, f"mobi_{method}") if progress_callback else None
+                    )
+                    
+                    if text and text.strip():
+                        method_pbar.update(1)
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"Error with MOBI {method}: {e}")
+                    
+                method_pbar.update(1)
+
+        return text.strip()
+
+    def extract_with_mobi(self, mobi_path: str, progress_callback=None) -> str:
+        """Extract text using mobi Python library"""
+        if not self._import_cache.is_available('mobi'):
+            return ""
+            
+        try:
+            mobi = self._import_cache.import_module('mobi')
+            
+            # The mobi Python package provides direct MOBI parsing
+            tempdir = None
+            try:
+                # Extract the MOBI file
+                with tempfile.TemporaryDirectory() as tempdir:
+                    book = mobi.Mobi(mobi_path)
+                    book.parse()
+                    
+                    # Extract the content
+                    text_parts = []
+                    
+                    # Process raw html content
+                    if hasattr(book, 'raw_html') and book.raw_html:
+                        # Try to process HTML with BeautifulSoup
+                        if self._import_cache.is_available('bs4'):
+                            BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
+                            
+                            soup = BeautifulSoup(book.raw_html, 'html.parser')
+                            # Remove script and style elements
+                            for script in soup(["script", "style"]):
+                                script.extract()
+                            
+                            # Get text
+                            text = soup.get_text()
+                            lines = (line.strip() for line in text.splitlines())
+                            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                            text = '\n'.join(chunk for chunk in chunks if chunk)
+                            text_parts.append(text)
+                        else:
+                            # Basic HTML cleaning if BeautifulSoup not available
+                            import re
+                            text = re.sub(r'<[^>]+>', ' ', book.raw_html)
+                            text = re.sub(r'\s+', ' ', text).strip()
+                            text_parts.append(text)
+                    
+                    # Alternative: try to get book contents
+                    if hasattr(book, 'book_header') and book.book_header:
+                        if hasattr(book.book_header, 'title') and book.book_header.title:
+                            text_parts.insert(0, f"Title: {book.book_header.title}\n")
+                        
+                        if hasattr(book.book_header, 'author') and book.book_header.author:
+                            text_parts.insert(1, f"Author: {book.book_header.author}\n")
+                    
+                    if progress_callback:
+                        progress_callback(1)
+                    
+                    return "\n\n".join(text_parts)
+            finally:
+                if tempdir and os.path.exists(tempdir):
+                    try:
+                        shutil.rmtree(tempdir)
+                    except:
+                        pass
+        except Exception as e:
+            logging.debug(f"MOBI library extraction failed: {e}")
+            return ""
+
+    def extract_with_kindleunpack(self, mobi_path: str, progress_callback=None) -> str:
+        """Extract text using kindleunpack library"""
+        if not self._import_cache.is_available('kindleunpack'):
+            return ""
+            
+        try:
+            kindleunpack = self._import_cache.import_module('kindleunpack')
+            
+            with tempfile.TemporaryDirectory() as tempdir:
+                # Use kindleunpack to extract the MOBI file
+                # kindleunpack.unpack can take a file path and output directory
+                try:
+                    kindleunpack.unpack(mobi_path, tempdir)
+                    
+                    # Look for text content in the extracted files
+                    text_parts = []
+                    
+                    # Check for HTML files
+                    html_files = []
+                    for root, _, files in os.walk(tempdir):
+                        for file in files:
+                            if file.endswith('.html') or file.endswith('.htm') or file.endswith('.xhtml'):
+                                html_files.append(os.path.join(root, file))
+                    
+                    # Process HTML files
+                    if html_files:
+                        if self._import_cache.is_available('bs4'):
+                            BeautifulSoup = self._import_cache.import_module('bs4').BeautifulSoup
+                            
+                            for html_file in html_files:
+                                with open(html_file, 'r', encoding='utf-8', errors='replace') as f:
+                                    html_content = f.read()
+                                
+                                soup = BeautifulSoup(html_content, 'html.parser')
+                                # Remove script and style elements
+                                for script in soup(["script", "style"]):
+                                    script.extract()
+                                
+                                # Get text
+                                text = soup.get_text()
+                                lines = (line.strip() for line in text.splitlines())
+                                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                                text = '\n'.join(chunk for chunk in chunks if chunk)
+                                text_parts.append(text)
+                        else:
+                            # Basic HTML cleaning if BeautifulSoup not available
+                            import re
+                            for html_file in html_files:
+                                with open(html_file, 'r', encoding='utf-8', errors='replace') as f:
+                                    html_content = f.read()
+                                
+                                text = re.sub(r'<[^>]+>', ' ', html_content)
+                                text = re.sub(r'\s+', ' ', text).strip()
+                                text_parts.append(text)
+                    
+                    # Check for text files
+                    for root, _, files in os.walk(tempdir):
+                        for file in files:
+                            if file.endswith('.txt'):
+                                with open(os.path.join(root, file), 'r', encoding='utf-8', errors='replace') as f:
+                                    text_parts.append(f.read())
+                    
+                    if progress_callback:
+                        progress_callback(1)
+                    
+                    return "\n\n".join(text_parts)
+                except Exception as e:
+                    logging.debug(f"KindleUnpack extraction failed: {e}")
+                    raise
+        except Exception as e:
+            logging.debug(f"MOBI KindleUnpack extraction failed: {e}")
+            return ""
+
+    def extract_with_calibre(self, mobi_path: str, progress_callback=None) -> str:
+        """Extract text using Calibre's ebook-convert tool"""
+        try:
+            import tempfile
+            import subprocess
+            import os
+            
+            # Create a temporary file for the extracted text
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                txt_path = temp.name
+            
+            # Use ebook-convert to convert MOBI to TXT
+            cmd = ['ebook-convert', mobi_path, txt_path]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"ebook-convert failed: {process.stderr}")
+            
+            # Read the output file
+            with open(txt_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            
+            # Clean up temporary file
+            try:
+                os.unlink(txt_path)
+            except:
+                pass
+            
+            if progress_callback:
+                progress_callback(1)
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"Calibre conversion failed: {e}")
+            return ""
+
+    def extract_with_zipfile(self, mobi_path: str, progress_callback=None) -> str:
+        """Extract text using low-level archive extraction methods"""
+        try:
+            import tempfile
+            import shutil
+            import os
+            import re
+            
+            # Since MOBI is a binary format, this is a last resort method
+            # Try to extract any text from it as a binary file
+            
+            # Create a temporary file and folder
+            with tempfile.TemporaryDirectory() as tempdir:
+                # Try to copy and process as a zip file first
+                # (some MOBI files are basically zip containers)
+                dest_file = os.path.join(tempdir, 'temp.mobi')
+                shutil.copy2(mobi_path, dest_file)
+                
+                text_parts = []
+                
+                # Try to extract as a ZIP archive
+                try:
+                    import zipfile
+                    if zipfile.is_zipfile(dest_file):
+                        with zipfile.ZipFile(dest_file) as zf:
+                            # Extract HTML and text files
+                            for item in zf.infolist():
+                                if item.filename.endswith('.html') or item.filename.endswith('.htm') or \
+                                   item.filename.endswith('.xhtml') or item.filename.endswith('.txt'):
+                                    try:
+                                        content = zf.read(item).decode('utf-8', errors='replace')
+                                        
+                                        # Basic HTML cleaning
+                                        if item.filename.endswith(('.html', '.htm', '.xhtml')):
+                                            content = re.sub(r'<[^>]+>', ' ', content)
+                                            content = re.sub(r'\s+', ' ', content).strip()
+                                        
+                                        text_parts.append(content)
+                                    except:
+                                        pass
+                except:
+                    pass
+                
+                # If no text found, try to extract any printable characters
+                if not text_parts:
+                    try:
+                        with open(dest_file, 'rb') as f:
+                            content = f.read()
+                            
+                            # Try to decode with different encodings
+                            for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                                try:
+                                    text = content.decode(encoding, errors='replace')
+                                    
+                                    # Extract only printable ASCII characters
+                                    printable = ''.join(c for c in text if c.isprintable() or c in ['\n', '\t', ' '])
+                                    
+                                    # Get only reasonably long words (likely real text, not binary junk)
+                                    words = re.findall(r'\b\w{3,}\b', printable)
+                                    
+                                    if words and len(words) > 100:  # Only if we have a reasonable amount of text
+                                        clean_text = ' '.join(words)
+                                        text_parts.append(clean_text)
+                                        break
+                                except:
+                                    continue
+                    except:
+                        pass
+                
+                if progress_callback:
+                    progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+                
+        except Exception as e:
+            logging.debug(f"MOBI binary extraction failed: {e}")
+            return ""
+        
+class DJVUExtractor:
+    """DJVU text extraction with multiple fallback methods"""
+    
+    def __init__(self, import_cache: ImportCache, debug: bool = False):
+        self._import_cache = import_cache
+        self._debug = debug
+        self._available_methods = None
+
+    @property
+    def available_methods(self) -> Dict[str, bool]:
+        """Lazy load available methods"""
+        if self._available_methods is None:
+            self._available_methods = {
+                'djvulibre': self._check_djvulibre(),
+                'pdf_conversion': self._check_pdf_conversion(),
+                'ocr': self._check_ocr_dependencies(),
+            }
+        return self._available_methods
+
+    def _check_djvulibre(self) -> bool:
+        """Check if djvulibre tools are available"""
+        # First check if python-djvulibre is available
+        if self._import_cache.is_available('djvu'):
+            return True
+            
+        # Otherwise check for djvutxt command line tool
+        try:
+            import shutil
+            return shutil.which('djvutxt') is not None
+        except:
+            return False
+    
+    def _check_pdf_conversion(self) -> bool:
+        """Check if DJVU to PDF conversion is available"""
+        try:
+            import shutil
+            return shutil.which('ddjvu') is not None
+        except:
+            return False
+    
+    def _check_ocr_dependencies(self) -> bool:
+        """Check if OCR dependencies are available"""
+        # We'll reuse the existing OCR infrastructure for images
+        ocr_methods = ['tesseract', 'pdf2image', 'pytesseract']
+        return all(self._import_cache.is_available(m) for m in ocr_methods)
+
+    def extract_text(self, djvu_path: str, preferred_method: Optional[str] = None,
+                    progress_callback: Optional[Callable] = None, **kwargs) -> str:
+        """
+        Extract text from DJVU with fallback methods
+        
+        Args:
+            djvu_path: Path to DJVU file
+            preferred_method: Optional preferred extraction method
+            progress_callback: Optional callback for progress updates
+            **kwargs: Additional options (ignored)
+            
+        Returns:
+            Extracted text
+        """
+        methods = ['djvulibre', 'pdf_conversion', 'ocr']
+        
+        # Reorder methods if preferred method is specified
+        if preferred_method and preferred_method in methods:
+            methods.insert(0, methods.pop(methods.index(preferred_method)))
+
+        text = ""
+        with tqdm(total=len(methods), desc="Trying DJVU extraction methods", unit="method") as method_pbar:
+            for method in methods:
+                if not self.available_methods.get(method, False):
+                    method_pbar.update(1)
+                    continue
+                    
+                try:
+                    if progress_callback:
+                        progress_callback(0, f"djvu_{method}")  # Signal start with method name
+                    
+                    extraction_func = getattr(self, f'extract_with_{method}')
+                    text = extraction_func(
+                        djvu_path,
+                        lambda n: progress_callback(n, f"djvu_{method}") if progress_callback else None
+                    )
+                    
+                    if text and text.strip():
+                        method_pbar.update(1)
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"Error with DJVU {method}: {e}")
+                    
+                method_pbar.update(1)
+
+        return text.strip()
+
+    def extract_with_djvulibre(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text using djvulibre library or command-line tools"""
+        # Try python-djvulibre first if available
+        if self._import_cache.is_available('djvu'):
+            try:
+                djvu = self._import_cache.import_module('djvu')
+                
+                # Use the Python bindings for DjVuLibre
+                text_parts = []
+                
+                with djvu.DjVuDocument.create_by_filename(djvu_path) as doc:
+                    total_pages = doc.pages_number
+                    
+                    with tqdm(total=total_pages, desc="DjVuLibre extraction", unit="pages") as pbar:
+                        for i in range(total_pages):
+                            try:
+                                page = doc.pages[i]
+                                page_text = page.text.decode('utf-8', errors='replace')
+                                if page_text.strip():
+                                    text_parts.append(page_text.strip())
+                                
+                                pbar.update(1)
+                                if progress_callback:
+                                    progress_callback(1)
+                            except Exception as e:
+                                logging.debug(f"Error extracting page {i+1}: {e}")
+                                if progress_callback:
+                                    progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+            except Exception as e:
+                logging.debug(f"Python-djvulibre extraction failed: {e}")
+                # Fall back to command line
+        
+        # Use djvutxt command line tool
+        try:
+            import subprocess
+            import tempfile
+            
+            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as temp:
+                temp_path = temp.name
+            
+            # Run djvutxt to extract text
+            cmd = ['djvutxt', djvu_path, temp_path]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"djvutxt failed: {process.stderr}")
+            
+            # Read the output file
+            with open(temp_path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+                
+            # Clean up temporary file
+            import os
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+                
+            return text
+                
+        except Exception as e:
+            logging.debug(f"DjVuLibre command-line extraction failed: {e}")
+            return ""
+
+    def extract_with_pdf_conversion(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text by converting to PDF first, then using PDF extraction"""
+        try:
+            import tempfile
+            import subprocess
+            import os
+            
+            # Create a temporary file for the PDF
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp:
+                pdf_path = temp.name
+            
+            # Convert DJVU to PDF
+            cmd = ['ddjvu', '-format=pdf', djvu_path, pdf_path]
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"DJVU to PDF conversion failed: {process.stderr}")
+            
+            # Use PDFExtractor to extract text from the converted PDF
+            from importlib import import_module
+            
+            # We need to import PDFExtractor from the module
+            # But avoid circular imports, so we'll create it dynamically
+            text = ""
+            try:
+                pdf_extractor = PDFExtractor(debug=self._debug)
+                text = pdf_extractor.extract_text(
+                    pdf_path,
+                    progress_callback=progress_callback
+                )
+            except Exception as e:
+                logging.debug(f"PDF extraction after conversion failed: {e}")
+            
+            # Clean up temporary PDF
+            try:
+                os.unlink(pdf_path)
+            except:
+                pass
+                
+            return text
+            
+        except Exception as e:
+            logging.debug(f"DJVU to PDF conversion failed: {e}")
+            return ""
+
+    def extract_with_ocr(self, djvu_path: str, progress_callback=None) -> str:
+        """Extract text using OCR by converting to images first"""
+        try:
+            # First convert DJVU to images
+            import tempfile
+            import subprocess
+            import os
+            import glob
+            
+            # Create a temporary directory for the images
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Convert DJVU to images
+                output_pattern = os.path.join(temp_dir, 'page_%d.tif')
+                cmd = ['ddjvu', '-format=tiff', djvu_path, output_pattern]
+                process = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if process.returncode != 0:
+                    raise RuntimeError(f"DJVU to images conversion failed: {process.stderr}")
+                
+                # Get list of generated images
+                image_files = sorted(glob.glob(os.path.join(temp_dir, 'page_*.tif')))
+                
+                if not image_files:
+                    raise RuntimeError("No images generated from DJVU")
+                
+                # Perform OCR on the images using tesseract
+                import pytesseract
+                from PIL import Image
+                
+                text_parts = []
+                with tqdm(total=len(image_files), desc="OCR processing", unit="page") as pbar:
+                    for image_file in image_files:
+                        try:
+                            img = Image.open(image_file)
+                            page_text = pytesseract.image_to_string(img, lang='eng')
+                            if page_text.strip():
+                                text_parts.append(page_text.strip())
+                            img.close()
+                            
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                        except Exception as e:
+                            logging.debug(f"OCR failed for image {image_file}: {e}")
+                            pbar.update(1)
+                            if progress_callback:
+                                progress_callback(1)
+                
+                return "\n\n".join(text_parts)
+                
+        except Exception as e:
+            logging.debug(f"DJVU OCR extraction failed: {e}")
+            return ""
 
 class EPUBExtractor:
     """EPUB text extraction with multiple fallback methods"""
@@ -5118,14 +5979,20 @@ def sanitize_filename(name):
         '!': '',    # remove exclamation
         '#': '',    # remove hash
         '=': '',    # remove equals sign
-        #'.': '',    # remove periods
     }
     
     for char, replacement in unsafe_chars.items():
         name = name.replace(char, replacement)
     
-    # Remove disallowed characters
-    # name = re.sub(r'[\\/*?:"<>|]', "", name)
+    # Clean up whitespace
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Handle periods to prevent double dots when adding extension
+    # Replace multiple consecutive dots with a single dot
+    name = re.sub(r'\.{2,}', '.', name)
+    
+    # Remove dot at the end of the name to prevent double dots with extension
+    name = name.rstrip('.')
     
     # Handle spacing and initials
     if " " in name:
@@ -5146,7 +6013,6 @@ def sanitize_filename(name):
         name = " ".join(new_parts)
     
     return name.strip().replace('/', '')
-
 
 def clean_author_name(author_name):
     """
@@ -5803,11 +6669,17 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
     # Clean up any extra spaces
     new_filename = re.sub(r'\s+', ' ', new_filename).strip()
     
+    # Make sure no double dots when adding extension
+    new_filename = new_filename.rstrip('.')
+    
     # If the new name doesn't already end with the real extension, append it
     if not new_filename.lower().endswith(orig_ext.lower()):
         new_filename += orig_ext
         if debug:
             logging.debug(f"Added extension: {new_filename}")
+    
+    # Final check for consecutive dots and remove them
+    new_filename = re.sub(r'\.{2,}', '.', new_filename)
     
     # Determine if we're on Windows
     is_windows = platform.system() == 'Windows'
@@ -5848,6 +6720,10 @@ def add_rename_command(rename_script_path, source_path, target_dir, new_filename
         
     # Target text file will be in the target directory with related name
     txt_new_filename = os.path.splitext(new_filename)[0] + ".txt"
+    
+    # Make sure no double dots in text filename
+    txt_new_filename = re.sub(r'\.{2,}', '.', txt_new_filename)
+    
     txt_target_path = os.path.join(target_dir, txt_new_filename)
     
     # Escape for bash
@@ -6086,12 +6962,14 @@ def main():
     
     """Command-line interface entry point"""
     parser = argparse.ArgumentParser(
-        description="Document Text Extraction Tool",
+        description="Document Text Extraction Tool for PDF, EPUB, DJVU, and MOBI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
               %(prog)s input.pdf
               %(prog)s -o output_dir/ *.pdf
+              %(prog)s --method=djvulibre input.djvu
+              %(prog)s --method=mobi input.mobi
               %(prog)s -m pymupdf -p password input.pdf
               %(prog)s -t -j output.json *.pdf
               %(prog)s --noskip input.pdf  # Process even if output exists
@@ -6134,7 +7012,7 @@ def main():
     
     parser.add_argument(
         '-m', '--method',
-        help="Preferred extraction method"
+        help="Preferred extraction method (pymupdf, pdfplumber, pypdf, pdfminer for PDF; ebooklib, bs4, zipfile for EPUB; djvulibre, pdf_conversion, ocr for DJVU; mobi, kindleunpack, calibre, zipfile for MOBI)"
     )
 
     parser.add_argument(
